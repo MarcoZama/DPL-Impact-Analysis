@@ -18,21 +18,32 @@ $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------------------
 # Caricamento settings (preferisce settings.local.json, poi settings.json)
+# Sceglie il primo file con valori Auth validi (ignora i placeholder PASTE-...).
 # ---------------------------------------------------------------------------
-$settingsFile = @("settings.local.json", "settings.json") |
+$candidateFiles = @("settings.local.json", "settings.json") |
     ForEach-Object { Join-Path $PSScriptRoot $_ } |
-    Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $settingsFile) {
-    Write-Error "File settings non trovato. Copiare settings.sample.json in settings.local.json e compilarlo."
+    Where-Object { Test-Path $_ }
+
+$cfg = $null; $tenantId = $null; $applicationId = $null; $clientSecret = $null
+foreach ($file in $candidateFiles) {
+    $candidate = Get-Content $file -Raw | ConvertFrom-Json
+    $t = $candidate.Auth.TenantId
+    $a = $candidate.Auth.ApplicationId
+    $s = $candidate.Auth.ClientSecret
+    $valid = $t -and $a -and $s -and ($t -notmatch '^PASTE') -and ($a -notmatch '^PASTE') -and ($s -notmatch '^PASTE')
+    if ($valid) {
+        $cfg = $candidate; $tenantId = $t; $applicationId = $a; $clientSecret = $s
+        Write-Host "Settings: $(Split-Path $file -Leaf)" -ForegroundColor DarkGray
+        break
+    }
 }
 
-$cfg           = Get-Content $settingsFile -Raw | ConvertFrom-Json
-$tenantId      = $cfg.Auth.TenantId
-$applicationId = $cfg.Auth.ApplicationId
-$clientSecret  = $cfg.Auth.ClientSecret
+if (-not $cfg) {
+    Write-Error "No settings file with valid Auth values found. Fill TenantId, ApplicationId and ClientSecret in settings.local.json or settings.json (placeholders 'PASTE-...' are ignored)."
+}
 
 if (-not $tenantId -or -not $applicationId -or -not $clientSecret) {
-    Write-Error "settings.json incompleto. Compilare TenantId, ApplicationId e ClientSecret."
+    Write-Error "Incomplete settings. Fill TenantId, ApplicationId and ClientSecret."
 }
 
 # ---------------------------------------------------------------------------
@@ -148,7 +159,15 @@ function Register-SPNInEnvironment {
             -Uri "$url/api/data/v9.2/systemusers?`$filter=applicationid eq '$applicationId'&`$select=systemuserid,fullname" `
             -Headers $headers
     } catch {
-        Write-Host "    SKIP — accesso Dataverse negato (verifica permesso 'Dynamics CRM - Application' nello SPN)" -ForegroundColor Yellow
+        $code = $null; $detail = $_.Exception.Message
+        try { $code = $_.Exception.Response.StatusCode.value__ } catch {}
+        try {
+            $stream = $_.Exception.Response.GetResponseStream()
+            if ($stream) { $detail = (New-Object System.IO.StreamReader($stream)).ReadToEnd() }
+        } catch {}
+        Write-Host "    SKIP — systemusers query failed$(if ($code) { " (HTTP $code)" })." -ForegroundColor Yellow
+        Write-Host "      Detail: $detail" -ForegroundColor DarkGray
+        Write-Host "      Your admin account likely has no security role inside this Dataverse environment (Global/PP Admin is not enough)." -ForegroundColor DarkGray
         return
     }
 

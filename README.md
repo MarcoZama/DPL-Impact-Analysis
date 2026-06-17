@@ -136,26 +136,29 @@ The script evaluates ACP impact as follows:
 
 1. It acquires a token for the Power Platform API
    (`https://api.powerplatform.com`).
-2. For each selected environment it resolves the environment group (if any) and
-   runs a **discovery** against the candidate endpoints listed in
-   `Acp.DiscoveryEndpoints` (templated with `{environmentId}` / `{groupId}`).
-3. Every successful response is dumped raw to the `debug` folder as
-   `ACP_Discovery_<endpoint>_<timestamp>.json` so the real preview schema can be
-   confirmed for your tenant.
-4. The allowlist connector IDs are parsed defensively from the response, and a
-   resource is flagged as an ACP violation when it uses a connector that is
-   **not** present in the allowlist (default-deny).
+2. For each selected environment it lists the rule-based policy assignments via
+   the documented governance API
+   (`governance/ruleBasedPolicies/environments/{environmentId}/assignments`,
+   api-version `2024-10-01`). This already includes policies inherited from the
+   environment group.
+3. For every assigned `policyId` it fetches the policy detail
+   (`governance/ruleBasedPolicies/{policyId}`), whose `ruleSets[].inputs` hold
+   the connector allowlist. The full policy JSON is dumped to the `debug` folder
+   as `ACP_Policy_<policyId>_<timestamp>.json`.
+4. The allowlist connector IDs are parsed from the rule sets, and a resource is
+   flagged as an ACP violation when it uses a connector that is **not** present
+   in the allowlist (default-deny).
 
 Limitations (reported as best-effort):
 
-- The endpoint that exposes the effective ACP allowlist is a **preview** feature
-  and is not part of the stable public REST reference; the candidate endpoints
-  are a starting point and may need adjusting once you inspect the dumped JSON.
+- The `inputs` schema of the rule sets is a **preview** feature and may change;
+  the raw policy JSON is dumped so the parsing can be verified for your tenant.
 - ACP officially covers **certified connectors only** (custom and HTTP
   connectors are not yet supported); custom/HTTP usage is evaluated on a
   best-effort basis.
-- ACP is evaluated only when an allowlist is successfully discovered for the
-  environment; otherwise the resource is reported as not in ACP scope.
+- ACP is evaluated only when a policy assignment with a parsable allowlist is
+  found for the environment; if a policy is assigned but the allowlist can't be
+  interpreted, the run reports it and points to the dumped JSON.
 
 ACP analysis is controlled from the `Acp` section in the settings file and can
 be turned off entirely.
@@ -218,11 +221,8 @@ Configuration is read from a settings file. The scripts prefer
     "Acp": {
         "Enabled": true,
         "DefaultDeny": true,
-        "DiscoveryEndpoints": [
-            "https://api.powerplatform.com/environmentmanagement/environmentGroups/{groupId}?api-version=2024-10-01",
-            "https://api.powerplatform.com/governance/environmentGroups/{groupId}/ruleSets?api-version=2024-10-01",
-            "https://api.powerplatform.com/governance/environments/{environmentId}/connectorPolicies?api-version=2024-10-01"
-        ]
+        "ApiBase": "https://api.powerplatform.com",
+        "ApiVersion": "2024-10-01"
     }
 }
 ```
@@ -238,8 +238,9 @@ Configuration is read from a settings file. The scripts prefer
 | `GranularDlp.AnalyzeActionControl` | Evaluate per-action `Allow`/`Block` rules. |
 | `GranularDlp.AnalyzeEndpointFiltering` | Evaluate endpoint `Allow`/`Deny` rules. |
 | `Acp.Enabled` | Master switch for Advanced Connector Policies (default-deny allowlist) analysis. |
-| `Acp.DefaultDeny` | Treat connectors not on the discovered allowlist as blocked. |
-| `Acp.DiscoveryEndpoints` | Candidate Power Platform API endpoints probed to discover the ACP allowlist (templated with `{environmentId}` / `{groupId}`). |
+| `Acp.DefaultDeny` | Treat connectors not on the resolved allowlist as blocked. |
+| `Acp.ApiBase` | Base URL of the Power Platform API used to read rule-based policy assignments and details. |
+| `Acp.ApiVersion` | API version for the Power Platform governance endpoints (default `2024-10-01`). |
 
 Both `settings.json` and `settings.local.json` are excluded from source control
 via `.gitignore` because they hold real credentials. Keep secrets only in your

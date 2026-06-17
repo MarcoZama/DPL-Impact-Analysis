@@ -1,0 +1,260 @@
+{
+  "StatusCode": 403,
+  "StatusDescription": null,
+  "Headers": [
+    {
+      "Key": "Date",
+      "Value": [
+        "Wed, 17 Jun 2026 22:35:40 GMT"
+      ]
+    },
+    {
+      "Key": "Cache-Control",
+      "Value": [
+        "no-store, no-cache"
+      ]
+    },
+    {
+      "Key": "Strict-Transport-Security",
+      "Value": [
+        "max-age=31536000; includeSubDomains"
+      ]
+    },
+    {
+      "Key": "x-ms-islandgateway",
+      "Value": [
+        "_prdcm001weugb0_3",
+        "_prdcm001wusgb0_4"
+      ]
+    },
+    {
+      "Key": "x-ms-igw-tracking-id",
+      "Value": [
+        "44f45b11-0b83-4413-9b55-c4ed872b762c20260617223540_prdcm001weugb0_3",
+        "88aea10e-a1ca-47b5-9ec2-0731b1911e9b20260617223541_prdcm001wusgb0_4"
+      ]
+    },
+    {
+      "Key": "mise-correlation-id",
+      "Value": [
+        "d17838d4-7a35-4c4d-845d-ea2503e7a07c",
+        "b4e7623c-1ee8-43e1-8753-5fb53c5ca759"
+      ]
+    },
+    {
+      "Key": "x-ms-destination-geo",
+      "Value": [
+        "unitedstates"
+      ]
+    },
+    {
+      "Key": "x-ms-request-id",
+      "Value": [
+        "westus:dbced8f5-d88c-4cae-852e-5c59e50fe96d"
+      ]
+    },
+    {
+      "Key": "x-ms-correlation-request-id",
+      "Value": [
+        "1e8aec33-39a4-456b-8f1f-c2130e0f40a2"
+      ]
+    },
+    {
+      "Key": "x-ms-correlation-id",
+      "Value": [
+        "1e8aec33-39a4-456b-8f1f-c2130e0f40a2"
+      ]
+    },
+    {
+      "Key": "Server-Timing",
+      "Value": [
+        "x-ms-igw-upstream-headers;dur=88.3,x-ms-igw-req-overhead;dur=0.4"
+      ]
+    },
+    {
+      "Key": "X-Content-Type-Options",
+      "Value": [
+        "nosniff"
+      ]
+    },
+    {
+      "Key": "x-ms-service-request-id",
+      "Value": [
+        "44f45b11-0b83-4413-9b55-c4ed872b762c"
+      ]
+    },
+    {
+      "Key": "x-ms-activity-vector",
+      "Value": [
+        "00.00.IN.03.00"
+      ]
+    }
+  ],
+  "Error": {
+    "code": "Forbidden",
+    "message": "The service principal with id '1432cd37-4ec5-4b9f-87a9-c0dcb6d83545' for application c4e19fbe-3b69-4817-97c7-30ff091ec061 does not have permission to access the path 'https://10.0.6.52:20451/providers/PowerPlatform.Governance/v1/tenants/40781680-d009-4452-87ba-72c57a0230a9/policies/0ad63823-786c-4879-b5de-16b86ba1f712/policyconnectorconfigurations' in tenant 40781680-d009-4452-87ba-72c57a0230a9.",
+    "detailUrlType": "NotSpecified"
+  },
+  "Message": "The service principal with id '1432cd37-4ec5-4b9f-87a9-c0dcb6d83545' for application c4e19fbe-3b69-4817-97c7-30ff091ec061 does not have permission to access the path 'https://10.0.6.52:20451/providers/PowerPlatform.Governance/v1/tenants/40781680-d009-4452-87ba-72c57a0230a9/policies/0ad63823-786c-4879-b5de-16b86ba1f712/policyconnectorconfigurations' in tenant 40781680-d009-4452-87ba-72c57a0230a9.",
+  "Internal": {
+    "Version": {
+      "Major": 1,
+      "Minor": 1,
+      "Build": -1,
+      "Revision": -1,
+      "MajorRevision": -1,
+      "MinorRevision": -1
+    },
+    "Content": {
+      "Headers": [
+        {
+          "Key": "Content-Length",
+          "Value": [
+            "472"
+          ]
+        },
+        {
+          "Key": "Content-Type",
+          "Value": [
+            "application/json; charset=utf-8"
+          ]
+        }
+      ]
+    },
+    "StatusCode": 403,
+    "ReasonPhrase": "Forbidden",
+    "Headers": [
+      {
+        "Key": "Date",
+        "Value": [
+          "Wed, 17 Jun 2026 22:35:40 GMT"
+        ]
+      },
+      {
+        "Key": "Cache-Control",
+        "Value": [
+          "no-store, no-cache"
+        ]
+      },
+      {
+        "Key": "Strict-Transport-Security",
+        "Value": [
+          "max-age=31536000; includeSubDomains"
+        ]
+      },
+      {
+        "Key": "x-ms-islandgateway",
+        "Value": [
+          "_prdcm001weugb0_3",
+          "_prdcm001wusgb0_4"
+        ]
+      },
+      {
+        "Key": "x-ms-igw-tracking-id",
+        "Value": [
+          "44f45b11-0b83-4413-9b55-c4ed872b762c20260617223540_prdcm001weugb0_3",
+          "88aea10e-a1ca-47b5-9ec2-0731b1911e9b20260617223541_prdcm001wusgb0_4"
+        ]
+      },
+      {
+        "Key": "mise-correlation-id",
+        "Value": [
+          "d17838d4-7a35-4c4d-845d-ea2503e7a07c",
+          "b4e7623c-1ee8-43e1-8753-5fb53c5ca759"
+        ]
+      },
+      {
+        "Key": "x-ms-destination-geo",
+        "Value": [
+          "unitedstates"
+        ]
+      },
+      {
+        "Key": "x-ms-request-id",
+        "Value": [
+          "westus:dbced8f5-d88c-4cae-852e-5c59e50fe96d"
+        ]
+      },
+      {
+        "Key": "x-ms-correlation-request-id",
+        "Value": [
+          "1e8aec33-39a4-456b-8f1f-c2130e0f40a2"
+        ]
+      },
+      {
+        "Key": "x-ms-correlation-id",
+        "Value": [
+          "1e8aec33-39a4-456b-8f1f-c2130e0f40a2"
+        ]
+      },
+      {
+        "Key": "Server-Timing",
+        "Value": [
+          "x-ms-igw-upstream-headers;dur=88.3,x-ms-igw-req-overhead;dur=0.4"
+        ]
+      },
+      {
+        "Key": "X-Content-Type-Options",
+        "Value": [
+          "nosniff"
+        ]
+      },
+      {
+        "Key": "x-ms-service-request-id",
+        "Value": [
+          "44f45b11-0b83-4413-9b55-c4ed872b762c"
+        ]
+      },
+      {
+        "Key": "x-ms-activity-vector",
+        "Value": [
+          "00.00.IN.03.00"
+        ]
+      }
+    ],
+    "TrailingHeaders": [],
+    "RequestMessage": {
+      "Version": {
+        "Major": 1,
+        "Minor": 1,
+        "Build": -1,
+        "Revision": -1,
+        "MajorRevision": -1,
+        "MinorRevision": -1
+      },
+      "VersionPolicy": 0,
+      "Content": null,
+      "Method": {
+        "Method": "GET"
+      },
+      "RequestUri": "https://api.bap.microsoft.com/providers/PowerPlatform.Governance/v1/tenants/40781680-d009-4452-87ba-72c57a0230a9/policies/0ad63823-786c-4879-b5de-16b86ba1f712/policyconnectorconfigurations",
+      "Headers": [
+        {
+          "Key": "User-Agent",
+          "Value": [
+            "PowerShell",
+            "cmdlets",
+            "1.0"
+          ]
+        },
+        {
+          "Key": "Authorization",
+          "Value": [
+            "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsIng1dCI6IndoMDZzRWt6TEhKNXNOTmFVeVJZMl82TzhLMCIsImtpZCI6IndoMDZzRWt6TEhKNXNOTmFVeVJZMl82TzhLMCJ9.eyJhdWQiOiJodHRwczovL3NlcnZpY2UucG93ZXJhcHBzLmNvbS8iLCJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC80MDc4MTY4MC1kMDA5LTQ0NTItODdiYS03MmM1N2EwMjMwYTkvIiwiaWF0IjoxNzgxNzM1NDI2LCJuYmYiOjE3ODE3MzU0MjYsImV4cCI6MTc4MTczOTMyNiwiYWlvIjoiQVNRQTIvOGNBQUFBb1R4UXErSm03TkNYSnJXUmc0YXJadGxiMGt2QXRFWHNSMWJtdHlMT05NVT0iLCJhcHBpZCI6ImM0ZTE5ZmJlLTNiNjktNDgxNy05N2M3LTMwZmYwOTFlYzA2MSIsImFwcGlkYWNyIjoiMSIsImlkcCI6Imh0dHBzOi8vc3RzLndpbmRvd3MubmV0LzQwNzgxNjgwLWQwMDktNDQ1Mi04N2JhLTcyYzU3YTAyMzBhOS8iLCJpZHR5cCI6ImFwcCIsIm9pZCI6IjE0MzJjZDM3LTRlYzUtNGI5Zi04N2E5LWMwZGNiNmQ4MzU0NSIsInJoIjoiMS5BWEVCZ0JaNFFBblFVa1NIdW5MRmVnSXdxY1ltVWtjT0FySlBpcEI2bHl5X3dkUUFBQUJ4QVEuIiwic3ViIjoiMTQzMmNkMzctNGVjNS00YjlmLTg3YTktYzBkY2I2ZDgzNTQ1IiwidGlkIjoiNDA3ODE2ODAtZDAwOS00NDUyLTg3YmEtNzJjNTdhMDIzMGE5IiwidXRpIjoiY3JqQ0kxaXFqVUN6TE9fcmFBQTJBQSIsInZlciI6IjEuMCIsInhtc19hY3RfZmN0IjoiOSAzIiwieG1zX2Z0ZCI6Ijg1cG9pZkNENlZwNkV3aURYWlJYLVREZUJMZzNQeXJpaWtPR1ZBWVVncm9CZFhOemIzVjBhQzFrYzIxeiIsInhtc19pZHJlbCI6IjcgMTIiLCJ4bXNfcmQiOiIwLkFXQUFuXzhLQmdnQ0VnTHhBaElVQ0FjU0VPcHBnSU42Qjh4S2t0Mlh4YXlGLUprU0ZBZ0pFaERRWUVYWE1IUDlTYUN3enljZ3gwcW1FaFFJQ0JJUXhpWlNSdzRDc2stS2tIcVhMTF9CMUJJVUNBc1NFRUg2ZlhPVEJ0VWJGNUVjZUxfbjBRcyIsInhtc19zdWJfZmN0IjoiMyA5In0.SwFjkYiLcTkhWFqtLMjfH30eSpwdIdNdrY15rBdAcPmStYOx5YopXz3FGwuXGYGEowXbsVMqScUqrISGjJJN5jZ1WlQ_kUm3-NK5WDRGpqKPq4jaYVXQB8mdrH6zUOdPScm-2Eak1gh9ah7yF8wn26EtNCxZONuXYvzhpCLHrmioQUkwKs0i8mSvvfhQsmEHHgzWrMg-tY0mXz79wue-jCSFjMfQOZzLSx9C4xmlNs_bCM5n3qJiT4eMclLa3YyNYpXCdb7ww56AuPFgiz8lzbYoDCgYIG806Dt7TQCMlvRpbIE4-NXfbGPOjxAgDnHj44Iitj73Yp_VFWTKMZJKMQ"
+          ]
+        },
+        {
+          "Key": "Accept-Encoding",
+          "Value": [
+            "gzip",
+            "deflate",
+            "br"
+          ]
+        }
+      ],
+      "Properties": [],
+      "Options": []
+    },
+    "IsSuccessStatusCode": false
+  }
+}

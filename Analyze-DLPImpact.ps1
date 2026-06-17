@@ -52,10 +52,17 @@ $GranularDlpEndpoints  = $true
 # ACP = vere Advanced Connector Policies (default-deny allowlist, per-environment/group)
 $AcpEnabled            = $true
 $AcpDefaultDeny        = $true
-$AcpDiscoveryEndpoints = @()
+$AcpApiBase            = "https://api.powerplatform.com"
+$AcpApiVersion         = "2024-10-01"
+# Sceglie il primo file con valori Auth validi (ignora i placeholder PASTE-...).
 $settingsFile = @("settings.local.json", "settings.json") |
     ForEach-Object { Join-Path $PSScriptRoot $_ } |
-    Where-Object { Test-Path $_ } | Select-Object -First 1
+    Where-Object { Test-Path $_ } |
+    Where-Object {
+        $c = Get-Content $_ -Raw | ConvertFrom-Json
+        $t = $c.Auth.TenantId
+        $t -and ($t -notmatch '^0+(-0+)+$') -and ($t -notmatch '^PASTE')
+    } | Select-Object -First 1
 if ($settingsFile) {
     $cfg = Get-Content $settingsFile -Raw | ConvertFrom-Json
     if (-not $TenantId      -and $cfg.Auth.TenantId      -notmatch '^0+(-0+)+$' -and $cfg.Auth.TenantId      -notmatch '^PASTE') { $TenantId      = $cfg.Auth.TenantId }
@@ -79,9 +86,10 @@ if ($settingsFile) {
     $acpProp = $cfg.PSObject.Properties['Acp']
     if ($acpProp -and $acpProp.Value) {
         $acpCfg = $acpProp.Value
-        $p = $acpCfg.PSObject.Properties['Enabled'];            if ($p) { $AcpEnabled     = [bool]$p.Value }
-        $p = $acpCfg.PSObject.Properties['DefaultDeny'];        if ($p) { $AcpDefaultDeny = [bool]$p.Value }
-        $p = $acpCfg.PSObject.Properties['DiscoveryEndpoints']; if ($p -and $p.Value) { $AcpDiscoveryEndpoints = @($p.Value) }
+        $p = $acpCfg.PSObject.Properties['Enabled'];     if ($p) { $AcpEnabled     = [bool]$p.Value }
+        $p = $acpCfg.PSObject.Properties['DefaultDeny']; if ($p) { $AcpDefaultDeny = [bool]$p.Value }
+        $p = $acpCfg.PSObject.Properties['ApiBase'];     if ($p -and $p.Value) { $AcpApiBase    = [string]$p.Value }
+        $p = $acpCfg.PSObject.Properties['ApiVersion'];  if ($p -and $p.Value) { $AcpApiVersion = [string]$p.Value }
     }
 }
 if (-not $OutputCsv) { $OutputCsv = ".\DLP_Impact_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv" }
@@ -112,10 +120,10 @@ function Show-Menu {
     }
     Write-Host ""
     do {
-        $raw = Read-Host "  Seleziona numero (1-$($Items.Count))"
+        $raw = Read-Host "  Select a number (1-$($Items.Count))"
         $n   = 0
         $ok  = [int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $Items.Count
-        if (-not $ok) { Write-Host "  Input non valido, riprova." -ForegroundColor Red }
+        if (-not $ok) { Write-Host "  Invalid input, try again." -ForegroundColor Red }
     } while (-not $ok)
     return $Items[$n - 1]
 }
@@ -132,12 +140,12 @@ function Show-MultiMenu {
         Write-Host ("  {0,3}. {1}{2}" -f ($i + 1), $Items[$i].$DisplayProp, $sub) -ForegroundColor White
     }
     Write-Host ""
-    Write-Host "  Puoi selezionare piu' voci separando i numeri con virgola (es: 1,3,5)" -ForegroundColor DarkGray
-    Write-Host "  Oppure digita '*' per selezionarli tutti." -ForegroundColor DarkGray
+    Write-Host "  You can select multiple items by separating numbers with commas (e.g. 1,3,5)" -ForegroundColor DarkGray
+    Write-Host "  Or type '*' to select all of them." -ForegroundColor DarkGray
     Write-Host ""
 
     do {
-        $raw = Read-Host "  Selezione"
+        $raw = Read-Host "  Selection"
         if ($raw -eq '*') {
             return $Items
         }
@@ -153,7 +161,7 @@ function Show-MultiMenu {
             }
         }
         if (-not $valid -or $nums.Count -eq 0) {
-            Write-Host "  Input non valido, riprova." -ForegroundColor Red
+            Write-Host "  Invalid input, try again." -ForegroundColor Red
             $valid = $false
         }
     } while (-not $valid)
@@ -204,7 +212,7 @@ function Invoke-DeviceCodeLogin {
             throw
         }
     } until ((Get-Date) -gt $deadline)
-    Write-Error "Autenticazione scaduta."
+    Write-Error "Authentication expired."
 }
 
 function Get-TokenForResource {
@@ -233,7 +241,7 @@ function Register-SPNInEnvironment {
     $url = $InstanceUrl.TrimEnd("/")
     try { $token = Get-TokenForResource -Resource $url }
     catch {
-        Write-Host "    SKIP — token non ottenuto: $_" -ForegroundColor Yellow
+        Write-Host "    SKIP — token not obtained: $_" -ForegroundColor Yellow
         return
     }
 
@@ -250,7 +258,15 @@ function Register-SPNInEnvironment {
             -Uri "$url/api/data/v9.2/systemusers?`$filter=applicationid eq '$ApplicationId'&`$select=systemuserid" `
             -Headers $h
     } catch {
-        Write-Host "    SKIP — accesso Dataverse negato (aggiungi 'Dynamics CRM Application' permission allo SPN)" -ForegroundColor Yellow
+        $code = $null; $detail = $_.Exception.Message
+        try { $code = $_.Exception.Response.StatusCode.value__ } catch {}
+        try {
+            $stream = $_.Exception.Response.GetResponseStream()
+            if ($stream) { $detail = (New-Object System.IO.StreamReader($stream)).ReadToEnd() }
+        } catch {}
+        Write-Host "    SKIP — systemusers query failed$(if ($code) { " (HTTP $code)" })." -ForegroundColor Yellow
+        Write-Host "      Detail: $detail" -ForegroundColor DarkGray
+        Write-Host "      Add the 'Dynamics CRM > user_impersonation' permission to the SPN and grant admin consent, or register it as an Application User with a security role." -ForegroundColor DarkGray
         return
     }
 
@@ -268,14 +284,14 @@ function Register-SPNInEnvironment {
             -Uri "$url/api/data/v9.2/systemusers($userId)/systemuserroles_association?`$select=roleid" -Headers $h
         $missing = @($targetRoles | Where-Object { $r = $_; -not ($assigned.value | Where-Object { $_.roleid -eq $r.roleid }) })
         if ($missing.Count -eq 0) {
-            Write-Host "    OK — gia' registrato con tutti i ruoli" -ForegroundColor Green
+            Write-Host "    OK — already registered with all roles" -ForegroundColor Green
         } else {
             foreach ($role in $missing) {
                 $ref = @{ "@odata.id" = "$url/api/data/v9.2/roles($($role.roleid))" } | ConvertTo-Json
                 Invoke-RestMethod -Method Post -Uri "$url/api/data/v9.2/systemusers($userId)/systemuserroles_association/`$ref" -Headers $h -Body $ref | Out-Null
-                Write-Host "    Ruolo aggiunto: $($role.name)" -ForegroundColor Yellow
+                Write-Host "    Role added: $($role.name)" -ForegroundColor Yellow
             }
-            Write-Host "    OK — ruoli aggiornati" -ForegroundColor Green
+            Write-Host "    OK — roles updated" -ForegroundColor Green
         }
         return
     }
@@ -296,7 +312,7 @@ function Register-SPNInEnvironment {
         $ref = @{ "@odata.id" = "$url/api/data/v9.2/roles($($role.roleid))" } | ConvertTo-Json
         Invoke-RestMethod -Method Post -Uri "$url/api/data/v9.2/systemusers($userId)/systemuserroles_association/`$ref" -Headers $h -Body $ref | Out-Null
     }
-    Write-Host "    CREATO con ruoli: $(($targetRoles | ForEach-Object { $_.name }) -join ', ')" -ForegroundColor Green
+    Write-Host "    CREATED with roles: $(($targetRoles | ForEach-Object { $_.name }) -join ', ')" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------
@@ -346,7 +362,7 @@ function Get-EnvBots {
             -Uri "$url/api/data/v9.2/bots?`$select=botid,name,_ownerid_value,statecode,schemaname&`$filter=statecode eq 0"
         return @($resp.value)
     } catch {
-        Write-Warning "    Impossibile recuperare bots da Dataverse: $_"
+        Write-Warning "    Unable to retrieve bots from Dataverse: $_"
         return @()
     }
 }
@@ -450,7 +466,7 @@ function Get-BotConnectorIds {
         } catch {}
 
     } catch {
-        Write-Warning "      Get-BotConnectorIds errore: $_"
+        Write-Warning "      Get-BotConnectorIds error: $_"
     }
 
     return @($connIds)
@@ -582,11 +598,11 @@ function Get-ViolationReason {
     $groups = @($ConnectorIds | ForEach-Object { Get-ConnectorGroup $_ $Policy } | Sort-Object -Unique)
     if ("Blocked" -in $groups) {
         $blockedConns = @($ConnectorIds | Where-Object { (Get-ConnectorGroup $_ $Policy) -eq "Blocked" } | ForEach-Object { Get-ConnectorName $_ $Policy })
-        return "Connettore bloccato: $($blockedConns -join ', ')"
+        return "Blocked connector: $($blockedConns -join ', ')"
     }
     $classified = @($groups | Where-Object { $_ -ne "Unclassified" -and $_ -ne "Blocked" })
     if ($classified.Count -gt 1) {
-        return "Mix gruppi non compatibili: $($classified -join ' + ')"
+        return "Incompatible group mix: $($classified -join ' + ')"
     }
     return ""
 }
@@ -614,14 +630,14 @@ function Get-GranularDlpConfigurations {
 
     $cmd = Get-Command Get-PowerAppDlpPolicyConnectorConfigurations -ErrorAction SilentlyContinue
     if (-not $cmd) {
-        Write-Host "  Cmdlet 'Get-PowerAppDlpPolicyConnectorConfigurations' non disponibile — ACP non analizzabili." -ForegroundColor DarkYellow
+        Write-Host "  Cmdlet 'Get-PowerAppDlpPolicyConnectorConfigurations' not available — ACP cannot be analyzed." -ForegroundColor DarkYellow
         return $result
     }
 
     try {
         $raw = Get-PowerAppDlpPolicyConnectorConfigurations -TenantId $TenantId -PolicyName $PolicyName -ErrorAction Stop
     } catch {
-        Write-Host "  Nessuna connector configuration (ACP) per questa policy." -ForegroundColor DarkGray
+        Write-Host "  No connector configuration (ACP) for this policy." -ForegroundColor DarkGray
         return $result
     }
     if (-not $raw) { return $result }
@@ -731,7 +747,7 @@ function Test-GranularDlpViolation {
                     $blockedUsed = @($usedActions | Where-Object { $conf.Rules.ContainsKey($_) -and $conf.Rules[$_] -match '(?i)Block|Deny' })
                     if ($blockedUsed.Count -gt 0) {
                         $violated = $true
-                        $reasons += "Azione bloccata su ${ck}: $($blockedUsed -join ', ')"
+                        $reasons += "Action blocked on ${ck}: $($blockedUsed -join ', ')"
                     }
                 }
             }
@@ -747,7 +763,7 @@ function Test-GranularDlpViolation {
                         $beh = Resolve-EndpointBehavior -Endpoint $ep -Rules $Acp.Endpoints[$ck]
                         if ($beh -match '(?i)Deny|Block') {
                             $violated = $true
-                            $reasons += "Endpoint negato su ${ck}: $ep"
+                            $reasons += "Endpoint denied on ${ck}: $ep"
                         }
                     }
                 }
@@ -760,77 +776,88 @@ function Test-GranularDlpViolation {
 
 # ---------------------------------------------------------------------------
 # Helpers — ACP (vere Advanced Connector Policies)
-# Modello default-deny allowlist, configurate per-environment o via environment
-# group. API in preview (Power Platform API, audience https://api.powerplatform.com):
-# l'endpoint che espone l'allowlist effettiva NON e' nel riferimento REST pubblico
-# stabile, quindi qui si usa una DISCOVERY su endpoint candidati con dump grezzo.
+# Modello default-deny allowlist, configurate per-environment o ereditate da un
+# environment group. Catena di API documentata (Power Platform API,
+# audience https://api.powerplatform.com, api-version 2024-10-01):
+#   1) GET governance/ruleBasedPolicies/environments/{environmentId}/assignments
+#      -> elenco assegnazioni (policyId), incluse quelle ereditate dal gruppo
+#   2) GET governance/ruleBasedPolicies/{policyId}
+#      -> dettaglio policy con ruleSets[].inputs = allowlist connettori ACP
+# Lo schema di 'inputs' e' in preview e puo' variare: si fa anche un dump grezzo.
 # ---------------------------------------------------------------------------
 
 function Get-AcpToken {
     # Access token per la Power Platform API (riusa il refresh token admin).
     try { return Get-TokenForResource -Resource "https://api.powerplatform.com" }
-    catch { Write-Host "    ACP: impossibile ottenere token Power Platform API: $_" -ForegroundColor DarkYellow; return $null }
+    catch { Write-Host "    ACP: unable to obtain Power Platform API token: $_" -ForegroundColor DarkYellow; return $null }
 }
 
 function Get-EnvAcpAllowlist {
-    # Recupera (best-effort, via discovery) l'allowlist ACP effettiva per un environment.
-    # Ritorna: @{ Available; Allow=HashSet<connectorKey>; Source; RawCount }
+    # Recupera l'allowlist ACP effettiva per un environment via API documentata.
+    # Ritorna: @{ Available; Allow=HashSet<connectorKey>; PolicyIds; RawCount }
     param(
         [string]$EnvironmentId,
-        [string]$EnvironmentGroupId,
         [string]$AcpToken,
-        [string[]]$Endpoints,
+        [string]$ApiBase = "https://api.powerplatform.com",
+        [string]$ApiVersion = "2024-10-01",
         [string]$DebugFolder
     )
 
     $allow  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $result = [pscustomobject]@{ Available = $false; Allow = $allow; Source = ""; RawCount = 0 }
+    $result = [pscustomobject]@{ Available = $false; Allow = $allow; PolicyIds = @(); RawCount = 0 }
     if (-not $AcpToken) { return $result }
-    if (-not $Endpoints -or $Endpoints.Count -eq 0) { return $result }
+    if (-not $EnvironmentId) { return $result }
 
     $headers = @{ Authorization = "Bearer $AcpToken"; "Content-Type" = "application/json" }
+    $base    = $ApiBase.TrimEnd('/')
 
-    foreach ($tpl in $Endpoints) {
-        if ([string]::IsNullOrWhiteSpace($tpl)) { continue }
-        # Salta i template che richiedono un groupId quando l'env non e' in un gruppo
-        if ($tpl -match '\{groupId\}' -and -not $EnvironmentGroupId) { continue }
-        $url = $tpl.Replace('{environmentId}', $EnvironmentId).Replace('{groupId}', [string]$EnvironmentGroupId)
+    # 1) Assegnazioni per l'environment (include quelle ereditate dal gruppo)
+    $assignUrl = "$base/governance/ruleBasedPolicies/environments/$EnvironmentId/assignments?includeRuleSetCounts=true&api-version=$ApiVersion"
+    try {
+        $assignResp = Invoke-RestMethod -Method Get -Uri $assignUrl -Headers $headers -ErrorAction Stop
+    } catch {
+        $code = $null; try { $code = $_.Exception.Response.StatusCode.value__ } catch {}
+        Write-Host "    ACP: no assignments ($(if ($code) { "HTTP $code" } else { 'error' }))" -ForegroundColor DarkGray
+        return $result
+    }
 
+    $policyIds = @()
+    if ($assignResp -and $assignResp.value) {
+        $policyIds = @($assignResp.value | ForEach-Object { Get-Prop $_ 'policyId' } | Where-Object { $_ } | Sort-Object -Unique)
+    }
+    $result.PolicyIds = $policyIds
+    if ($policyIds.Count -eq 0) { return $result }
+
+    # 2) Per ogni policy, dettaglio con i rule set (inputs = allowlist)
+    foreach ($polId in $policyIds) {
+        $polUrl = "$base/governance/ruleBasedPolicies/$polId`?api-version=$ApiVersion"
         try {
-            $resp = Invoke-RestMethod -Method Get -Uri $url -Headers $headers -ErrorAction Stop
+            $polResp = Invoke-RestMethod -Method Get -Uri $polUrl -Headers $headers -ErrorAction Stop
         } catch {
-            $code = $null
-            try { $code = $_.Exception.Response.StatusCode.value__ } catch {}
-            Write-Host "    ACP discovery: $url -> $(if ($code) { "HTTP $code" } else { 'errore' })" -ForegroundColor DarkGray
+            $code = $null; try { $code = $_.Exception.Response.StatusCode.value__ } catch {}
+            Write-Host "    ACP: policy detail $polId not retrievable ($(if ($code) { "HTTP $code" } else { 'error' }))" -ForegroundColor DarkGray
             continue
         }
-        if (-not $resp) { continue }
+        if (-not $polResp) { continue }
 
-        # Dump grezzo per verifica dello schema reale (preview)
+        # Dump grezzo per verifica dello schema reale di 'inputs' (preview)
         try {
             if ($DebugFolder) {
-                $safe = ($url -replace '[^A-Za-z0-9]+', '_')
-                if ($safe.Length -gt 80) { $safe = $safe.Substring(0, 80) }
-                $dump = Join-Path $DebugFolder "ACP_Discovery_${safe}_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
-                $resp | ConvertTo-Json -Depth 30 | Set-Content -Path $dump -Encoding UTF8
+                $dump = Join-Path $DebugFolder "ACP_Policy_${polId}_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+                $polResp | ConvertTo-Json -Depth 40 | Set-Content -Path $dump -Encoding UTF8
             }
         } catch {}
 
-        # Parsing difensivo dell'allowlist: raccoglie gli ID/nome connettore presenti
-        # nella risposta. Lo schema esatto va confermato sul dump del tuo tenant.
+        # Parsing difensivo dell'allowlist dai rule set
         $json = $null
-        try { $json = $resp | ConvertTo-Json -Depth 30 } catch {}
+        try { $json = $polResp | ConvertTo-Json -Depth 40 } catch {}
         if ($json) {
-            $before = $allow.Count
             foreach ($m in [regex]::Matches($json, '(?i)/providers/Microsoft\.PowerApps/apis/(shared_[a-z0-9_]+)')) { [void]$allow.Add($m.Groups[1].Value.ToLowerInvariant()) }
-            foreach ($m in [regex]::Matches($json, '(?i)"(?:connectorId|connectorName|apiName|id|name)"\s*:\s*"(?:[^"]*\/)?(shared_[a-z0-9_]+)"')) { [void]$allow.Add($m.Groups[1].Value.ToLowerInvariant()) }
-            if ($allow.Count -gt $before) {
-                $result.Available = $true
-                $result.Source    = $url
-            }
+            foreach ($m in [regex]::Matches($json, '(?i)"(?:connectorId|connectorName|apiName|connector|id|name)"\s*:\s*"(?:[^"]*\/)?(shared_[a-z0-9_]+)"')) { [void]$allow.Add($m.Groups[1].Value.ToLowerInvariant()) }
         }
     }
 
+    if ($allow.Count -gt 0) { $result.Available = $true }
     $result.RawCount = $allow.Count
     return $result
 }
@@ -848,7 +875,7 @@ function Test-AcpViolation {
     }
     $blocked = @($blocked | Sort-Object -Unique)
     if ($blocked.Count -gt 0) {
-        return [pscustomobject]@{ Violated = $true; Reason = "Connettori non in allowlist ACP (default-deny): $($blocked -join ', ')" }
+        return [pscustomobject]@{ Violated = $true; Reason = "Connectors not in ACP allowlist (default-deny): $($blocked -join ', ')" }
     }
     return [pscustomobject]@{ Violated = $false; Reason = "" }
 }
@@ -882,7 +909,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
 # STEP 1 — Moduli
-Write-Host "[1/5] Verifica moduli PowerShell..." -ForegroundColor Cyan
+Write-Host "[1/5] Checking PowerShell modules..." -ForegroundColor Cyan
 if (-not (Get-Module -ListAvailable -Name "Microsoft.PowerApps.Administration.PowerShell")) {
     Install-Module "Microsoft.PowerApps.Administration.PowerShell" -Scope CurrentUser -Force -AllowClobber
 }
@@ -891,10 +918,10 @@ Import-Module "Microsoft.PowerApps.PowerShell"                -WarningAction Sil
 
 # STEP 2 — Auth device code
 Write-Host ""
-Write-Host "[2/5] Autenticazione (Device Code)..." -ForegroundColor Cyan
+Write-Host "[2/5] Authentication (Device Code)..." -ForegroundColor Cyan
 if (-not $TenantId) { $TenantId = Read-Host "  Tenant ID" }
 Invoke-DeviceCodeLogin -Scope "https://service.powerapps.com/.default offline_access"
-Write-Host "  Login completato." -ForegroundColor Green
+Write-Host "  Login completed." -ForegroundColor Green
 
 # Autentica anche il modulo PowerApps con SPN (per Get-AdminDlpPolicy, Get-AdminFlow, ecc.)
 if ($ApplicationId -and $ClientSecret) {
@@ -905,7 +932,7 @@ if ($ApplicationId -and $ClientSecret) {
 
 # STEP 3 — Selezione environment (multipla)
 Write-Host ""
-Write-Host "[3/5] Recupero environment del tenant..." -ForegroundColor Cyan
+Write-Host "[3/5] Retrieving tenant environments..." -ForegroundColor Cyan
 $bapH    = @{ Authorization = "Bearer $script:adminToken"; "Content-Type" = "application/json" }
 $bapResp = Invoke-RestMethod -Method Get `
     -Uri "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments?api-version=2019-05-01&`$expand=properties.linkedEnvironmentMetadata" `
@@ -916,8 +943,8 @@ $allEnvs = @($bapResp.value | ForEach-Object {
                     -PassThru -Force
 })
 
-if ($allEnvs.Count -eq 0) { Write-Error "Nessun environment trovato nel tenant." }
-Write-Host "  Trovati $($allEnvs.Count) environment."
+if ($allEnvs.Count -eq 0) { Write-Error "No environment found in the tenant." }
+Write-Host "  Found $($allEnvs.Count) environments."
 
 $selectedEnvs = Show-MultiMenu `
     -Items       $allEnvs `
@@ -925,16 +952,17 @@ $selectedEnvs = Show-MultiMenu `
     -Title       "Seleziona gli environment da analizzare:"
 
 Write-Host ""
-Write-Host "  Environment selezionati:" -ForegroundColor Yellow
+Write-Host "  Selected environments:" -ForegroundColor Yellow
 $selectedEnvs | ForEach-Object { Write-Host "    - $($_.properties.displayName)" -ForegroundColor White }
 
 # STEP 4 — Registra SPN negli environment selezionati
 Write-Host ""
-Write-Host "[4/5] Registrazione SPN negli environment selezionati..." -ForegroundColor Cyan
+Write-Host "[4/5] Registering SPN in selected environments..." -ForegroundColor Cyan
+Write-Host "  The SPN is created as an Application User (System Administrator) if missing, only for the selected environments." -ForegroundColor DarkGray
 foreach ($env in $selectedEnvs) {
     $instanceUrl = $env.properties.linkedEnvironmentMetadata.instanceUrl
     if (-not $instanceUrl) {
-        Write-Host "  $($env.properties.displayName) — SKIP (nessuna istanza Dataverse)" -ForegroundColor DarkGray
+        Write-Host "  $($env.properties.displayName) — SKIP (no Dataverse instance)" -ForegroundColor DarkGray
         continue
     }
     Write-Host "  $($env.properties.displayName)" -ForegroundColor White
@@ -943,7 +971,7 @@ foreach ($env in $selectedEnvs) {
 
 # STEP 5a — Selezione DLP Policy (via governance REST API con token admin)
 Write-Host ""
-Write-Host "[5/5] Recupero DLP Policy del tenant..." -ForegroundColor Cyan
+Write-Host "[5/5] Retrieving tenant DLP policies..." -ForegroundColor Cyan
 
 $govH      = @{ Authorization = "Bearer $script:adminToken"; "Content-Type" = "application/json" }
 $govResp   = Invoke-RestMethod -Method Get -Headers $govH `
@@ -951,13 +979,13 @@ $govResp   = Invoke-RestMethod -Method Get -Headers $govH `
 $rawPolicies = @($govResp.value)
 
 if ($rawPolicies.Count -eq 0) {
-    Write-Host "  Nessuna DLP Policy trovata. Creane una su:" -ForegroundColor Red
+    Write-Host "  No DLP policy found. Create one at:" -ForegroundColor Red
     Write-Host "  https://admin.powerplatform.microsoft.com/dlp-policies" -ForegroundColor DarkGray
     exit 1
 }
 
 # Per ogni policy recupera i dettagli completi (connectorGroups con classificazioni)
-Write-Host "  Trovate $($rawPolicies.Count) policy."
+Write-Host "  Found $($rawPolicies.Count) policies."
 
 # L'oggetto restituito dalla list API contiene gia' tutto: name, displayName, connectorGroups, environments
 $allPolicies = @($rawPolicies | ForEach-Object {
@@ -977,43 +1005,43 @@ $selectedPolicy = Show-Menu `
 
 # Mostra scope della policy (tutti gli env o solo specifici)
 $policyScope = if ($selectedPolicy.environments -and $selectedPolicy.environments.Count -gt 0) {
-    "Solo $($selectedPolicy.environments.Count) environment specifici"
-} else { "Tutti gli environment del tenant" }
+    "Only $($selectedPolicy.environments.Count) specific environments"
+} else { "All tenant environments" }
 $blockedCount  = @($selectedPolicy.connectorGroups | Where-Object { $_.classification -eq "Blocked" }  | ForEach-Object { $_.connectors }).Count
 $businessCount = @($selectedPolicy.connectorGroups | Where-Object { $_.classification -eq "Business" } | ForEach-Object { $_.connectors }).Count
 $nonBizCount   = @($selectedPolicy.connectorGroups | Where-Object { $_.classification -eq "NonBusiness" } | ForEach-Object { $_.connectors }).Count
 
 Write-Host ""
-Write-Host "  Policy selezionata : $($selectedPolicy.DisplayName)" -ForegroundColor Yellow
+Write-Host "  Selected policy    : $($selectedPolicy.DisplayName)" -ForegroundColor Yellow
 Write-Host "  Scope              : $policyScope"                   -ForegroundColor DarkGray
-Write-Host "  Connettori Business: $businessCount | NonBusiness: $nonBizCount | Blocked: $blockedCount" -ForegroundColor DarkGray
+Write-Host "  Business connectors: $businessCount | NonBusiness: $nonBizCount | Blocked: $blockedCount" -ForegroundColor DarkGray
 
 # STEP 5a-bis — Recupero Granular DLP (action control + endpoint filtering) della policy
 $granularDlp = [pscustomobject]@{ Available = $false; Actions = @{}; Endpoints = @{}; ActionConnectors = 0; EndpointConnectors = 0 }
 if ($GranularDlpEnabled) {
     Write-Host ""
-    Write-Host "  Recupero Granular DLP (action control / endpoint filtering)..." -ForegroundColor Cyan
+    Write-Host "  Retrieving Granular DLP (action control / endpoint filtering)..." -ForegroundColor Cyan
     $granularDlp = Get-GranularDlpConfigurations -TenantId $TenantId -PolicyName $selectedPolicy.PolicyName -DebugFolder $DebugFolder
     if ($granularDlp.Available) {
-        Write-Host "  Granular DLP attive — Action control: $($granularDlp.ActionConnectors) connettori | Endpoint filtering: $($granularDlp.EndpointConnectors) connettori" -ForegroundColor Yellow
+        Write-Host "  Granular DLP active — Action control: $($granularDlp.ActionConnectors) connectors | Endpoint filtering: $($granularDlp.EndpointConnectors) connectors" -ForegroundColor Yellow
     } else {
-        Write-Host "  Nessuna regola Granular DLP trovata per questa policy." -ForegroundColor DarkGray
+        Write-Host "  No Granular DLP rule found for this policy." -ForegroundColor DarkGray
     }
 } else {
-    Write-Host "  Analisi Granular DLP disabilitata da settings (GranularDlp.Enabled = false)." -ForegroundColor DarkGray
+    Write-Host "  Granular DLP analysis disabled in settings (GranularDlp.Enabled = false)." -ForegroundColor DarkGray
 }
 
 # STEP 5a-ter — Token Power Platform API per le vere Advanced Connector Policies (ACP)
 $acpToken = $null
 if ($AcpEnabled) {
     Write-Host ""
-    Write-Host "  Analisi ACP (Advanced Connector Policies, default-deny) abilitata." -ForegroundColor Cyan
+    Write-Host "  ACP analysis (Advanced Connector Policies, default-deny) enabled." -ForegroundColor Cyan
     $acpToken = Get-AcpToken
     if (-not $acpToken) {
-        Write-Host "  ACP: token non disponibile, analisi ACP saltata." -ForegroundColor DarkYellow
+        Write-Host "  ACP: token not available, ACP analysis skipped." -ForegroundColor DarkYellow
     }
 } else {
-    Write-Host "  Analisi ACP disabilitata da settings (Acp.Enabled = false)." -ForegroundColor DarkGray
+    Write-Host "  ACP analysis disabled in settings (Acp.Enabled = false)." -ForegroundColor DarkGray
 }
 
 # STEP 5b — Analisi impatto su tutti gli environment selezionati
@@ -1024,28 +1052,20 @@ foreach ($env in $selectedEnvs) {
     $envName = $env.properties.displayName
 
     Write-Host ""
-    Write-Host "  Analisi: $envName" -ForegroundColor Cyan
+    Write-Host "  Analyzing: $envName" -ForegroundColor Cyan
 
     $instanceUrl = $env.properties.linkedEnvironmentMetadata.instanceUrl
 
     # ACP — risoluzione allowlist (default-deny) per questo environment
-    $acpEnv = [pscustomobject]@{ Available = $false; Allow = $null; Source = ""; RawCount = 0 }
+    $acpEnv = [pscustomobject]@{ Available = $false; Allow = $null; PolicyIds = @(); RawCount = 0 }
     if ($AcpEnabled -and $acpToken) {
-        $envGroupId = $null
-        $propsObj = Get-Prop $env 'properties'
-        if ($propsObj) {
-            $pg = $propsObj.PSObject.Properties['parentEnvironmentGroup']
-            if ($pg -and $pg.Value) { $envGroupId = (Get-Prop $pg.Value 'id') }
-            if (-not $envGroupId) {
-                $eg = $propsObj.PSObject.Properties['environmentGroup']
-                if ($eg -and $eg.Value) { $envGroupId = (Get-Prop $eg.Value 'id') }
-            }
-        }
-        $acpEnv = Get-EnvAcpAllowlist -EnvironmentId $envId -EnvironmentGroupId $envGroupId -AcpToken $acpToken -Endpoints $AcpDiscoveryEndpoints -DebugFolder $DebugFolder
+        $acpEnv = Get-EnvAcpAllowlist -EnvironmentId $envId -AcpToken $acpToken -ApiBase $AcpApiBase -ApiVersion $AcpApiVersion -DebugFolder $DebugFolder
         if ($acpEnv.Available) {
-            Write-Host "  ACP attiva per questo environment — $($acpEnv.RawCount) connettori in allowlist (default-deny)" -ForegroundColor Yellow
+            Write-Host "  ACP active for this environment — $($acpEnv.RawCount) connectors in allowlist (default-deny), policy: $($acpEnv.PolicyIds -join ', ')" -ForegroundColor Yellow
+        } elseif ($acpEnv.PolicyIds.Count -gt 0) {
+            Write-Host "  ACP assigned (policy: $($acpEnv.PolicyIds -join ', ')) but allowlist not parsed — see dump in debug/." -ForegroundColor DarkYellow
         } else {
-            Write-Host "  Nessuna ACP rilevata per questo environment (discovery)." -ForegroundColor DarkGray
+            Write-Host "  No ACP assigned to this environment." -ForegroundColor DarkGray
         }
     }
 
@@ -1064,15 +1084,15 @@ foreach ($env in $selectedEnvs) {
         try {
             $flows = @(Get-DataverseAll -Headers $dvH -PageSize $pageSize `
                 -Uri "$url/api/data/v9.2/workflows?`$filter=category eq 5&`$select=workflowid,name,clientdata,_ownerid_value,statecode,modifiedon")
-            Write-Host "    Trovati $($flows.Count) flow da Dataverse."
-        } catch { Write-Warning "    Impossibile recuperare flows da Dataverse: $_" }
+            Write-Host "    Found $($flows.Count) flows from Dataverse."
+        } catch { Write-Warning "    Unable to retrieve flows from Dataverse: $_" }
 
         # Canvas App = category 9
         try {
             $apps = @(Get-DataverseAll -Headers $dvH -PageSize $pageSize `
                 -Uri "$url/api/data/v9.2/workflows?`$filter=category eq 9&`$select=workflowid,name,clientdata,_ownerid_value,statecode")
-            Write-Host "    Trovate $($apps.Count) app Canvas da Dataverse."
-        } catch { Write-Warning "    Impossibile recuperare apps da Dataverse: $_" }
+            Write-Host "    Found $($apps.Count) Canvas apps from Dataverse."
+        } catch { Write-Warning "    Unable to retrieve apps from Dataverse: $_" }
 
         # Leggi connectionreferences in blocco — mappa connectionreferencelogicalname -> connectorId.
         # NB: la tabella 'connectionreference' NON ha un lookup diretto al workflow,
@@ -1085,21 +1105,21 @@ foreach ($env in $selectedEnvs) {
                     $connRefByLogName[$cr.connectionreferencelogicalname] = $cr.connectorid
                 }
             }
-            Write-Host "    ConnectionReferences caricate: $($allCR.Count) voci."
-        } catch { Write-Warning "    Impossibile recuperare connectionreferences: $_" }
+            Write-Host "    ConnectionReferences loaded: $($allCR.Count) entries."
+        } catch { Write-Warning "    Unable to retrieve connectionreferences: $_" }
     } else {
-        Write-Warning "    Environment senza Dataverse — flow e app non analizzabili"
+        Write-Warning "    Environment without Dataverse — flows and apps cannot be analyzed"
     }
 
     $bots = if ($instanceUrl) { Get-EnvBots -InstanceUrl $instanceUrl } else { @() }
-    Write-Host "    Flow: $($flows.Count)  |  App Canvas: $($apps.Count)  |  Agenti: $($bots.Count)"
+    Write-Host "    Flows: $($flows.Count)  |  Canvas apps: $($apps.Count)  |  Agents: $($bots.Count)"
 
     $total = $flows.Count + $apps.Count + $bots.Count; $counter = 0
 
     # --- FLOWS (da Dataverse workflows category=5, clientdata contiene connectionReferences) ---
     foreach ($flow in $flows) {
         $counter++
-        Write-Progress -Activity "Analisi $envName" -Status "Flow: $($flow.name)" `
+        Write-Progress -Activity "Analyzing $envName" -Status "Flow: $($flow.name)" `
                        -PercentComplete ([math]::Round($counter / [math]::Max($total,1) * 100))
         try {
             # Priorita' 1: connectionreferences lookup (diretto, affidabile)
@@ -1113,7 +1133,7 @@ foreach ($env in $selectedEnvs) {
                 if ($logIds.Count -gt 0) { $connIds = $logIds }
             }
 
-            Write-Host ("      Flow: {0,-40} connettori: {1}" -f $flow.name, $(if ($connIds) { $connIds.Count } else { "nessuno" })) -ForegroundColor $(if ($connIds) { "White" } else { "DarkGray" })
+            Write-Host ("      Flow: {0,-40} connectors: {1}" -f $flow.name, $(if ($connIds) { $connIds.Count } else { "none" })) -ForegroundColor $(if ($connIds) { "White" } else { "DarkGray" })
 
             if (-not $connIds) {
                 if ($ShowAllResources) {
@@ -1122,7 +1142,7 @@ foreach ($env in $selectedEnvs) {
                         EnvironmentName=$envName; EnvironmentId=$envId
                         ResourceType="Flow"; ResourceName=$flow.name; ResourceId=$flow.workflowid
                         Owner=""; State=if($flow.statecode -eq 1){"Active"}else{"Inactive"}
-                        ConnectorsUsed=""; ConnectorGroups=""; DlpViolation=$false; ViolationReason="Nessun connettore rilevato"
+                        ConnectorsUsed=""; ConnectorGroups=""; DlpViolation=$false; ViolationReason="No connector detected"
                         GranularDlpViolation=$false; GranularDlpViolationReason=""
                         AcpViolation=$false; AcpViolationReason=""
                         Impacted=$false; ImpactCount=0; ImpactSources=""
@@ -1164,7 +1184,7 @@ foreach ($env in $selectedEnvs) {
     # --- APP CANVAS (da Dataverse workflows category=9) ---
     foreach ($app in $apps) {
         $counter++
-        Write-Progress -Activity "Analisi $envName" -Status "App: $($app.name)" `
+        Write-Progress -Activity "Analyzing $envName" -Status "App: $($app.name)" `
                        -PercentComplete ([math]::Round($counter / [math]::Max($total,1) * 100))
         try {
             $connIds = if ($connRefLookup[$app.workflowid]) { @($connRefLookup[$app.workflowid]) } else { @() }
@@ -1175,7 +1195,7 @@ foreach ($env in $selectedEnvs) {
                 if ($logIds.Count -gt 0) { $connIds = $logIds }
             }
 
-            Write-Host ("      App : {0,-40} connettori: {1}" -f $app.name, $(if ($connIds) { $connIds.Count } else { "nessuno" })) -ForegroundColor $(if ($connIds) { "White" } else { "DarkGray" })
+            Write-Host ("      App : {0,-40} connectors: {1}" -f $app.name, $(if ($connIds) { $connIds.Count } else { "none" })) -ForegroundColor $(if ($connIds) { "White" } else { "DarkGray" })
 
             if (-not $connIds) {
                 if ($ShowAllResources) {
@@ -1184,7 +1204,7 @@ foreach ($env in $selectedEnvs) {
                         EnvironmentName=$envName; EnvironmentId=$envId
                         ResourceType="PowerApp"; ResourceName=$app.name; ResourceId=$app.workflowid
                         Owner=""; State=if($app.statecode -eq 1){"Active"}else{"Inactive"}
-                        ConnectorsUsed=""; ConnectorGroups=""; DlpViolation=$false; ViolationReason="Nessun connettore rilevato"
+                        ConnectorsUsed=""; ConnectorGroups=""; DlpViolation=$false; ViolationReason="No connector detected"
                         GranularDlpViolation=$false; GranularDlpViolationReason=""
                         AcpViolation=$false; AcpViolationReason=""
                         Impacted=$false; ImpactCount=0; ImpactSources=""
@@ -1226,7 +1246,7 @@ foreach ($env in $selectedEnvs) {
     # --- AGENTI COPILOT STUDIO ---
     foreach ($bot in $bots) {
         $counter++
-        Write-Progress -Activity "Analisi $envName" -Status "Agente: $($bot.name)" `
+        Write-Progress -Activity "Analyzing $envName" -Status "Agent: $($bot.name)" `
                        -PercentComplete ([math]::Round($counter / [math]::Max($total,1) * 100))
         try {
             $connIds = @(Get-BotConnectorIds -BotId $bot.botid -InstanceUrl $instanceUrl)
@@ -1249,17 +1269,17 @@ foreach ($env in $selectedEnvs) {
                 DlpViolation    = $violated
                 ViolationReason = if ($violated) { Get-ViolationReason $connIds $selectedPolicy } else { "" }
                 GranularDlpViolation       = $false
-                GranularDlpViolationReason = "Granular DLP non valutato (agente)"
+                GranularDlpViolationReason = "Granular DLP not evaluated (agent)"
                 AcpViolation    = $acpRes.Violated
                 AcpViolationReason = $acpRes.Reason
                 Impacted        = $impact.Impacted
                 ImpactCount     = $impact.ImpactCount
                 ImpactSources   = $impact.ImpactSources
             })
-        } catch { Write-Warning "    Agente '$($bot.name)': $_" }
+        } catch { Write-Warning "    Agent '$($bot.name)': $_" }
     }
 
-    Write-Progress -Activity "Analisi $envName" -Completed
+    Write-Progress -Activity "Analyzing $envName" -Completed
 }
 
 # ---------------------------------------------------------------------------
@@ -1282,22 +1302,22 @@ $xAllThree = @($results | Where-Object { $_.DlpViolation -and $_.GranularDlpViol
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "   RIEPILOGO" -ForegroundColor Cyan
+Write-Host "   SUMMARY" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Policy             : $($selectedPolicy.DisplayName)"
 Write-Host "  Environment        : $(($selectedEnvs | ForEach-Object { $_.properties.displayName }) -join ', ')"
-Write-Host "  Risorse totali     : $($results.Count)"
-Write-Host "  Violazioni DLP     : $($violated.Count)"     -ForegroundColor $(if ($violated.Count -gt 0) { "Red" } else { "Green" })
-Write-Host "  Violazioni Granular: $($gdlpViolated.Count)" -ForegroundColor $(if ($gdlpViolated.Count -gt 0) { "Red" } else { "Green" })
-Write-Host "  Violazioni ACP     : $($acpViolated.Count)"  -ForegroundColor $(if ($acpViolated.Count -gt 0) { "Red" } else { "Green" })
-Write-Host "  Impattate (totale) : $($impacted.Count)"     -ForegroundColor $(if ($impacted.Count -gt 0) { "Red" } else { "Green" })
-Write-Host "  Non impattate      : $($clean.Count)"        -ForegroundColor Green
+Write-Host "  Total resources    : $($results.Count)"
+Write-Host "  DLP violations     : $($violated.Count)"     -ForegroundColor $(if ($violated.Count -gt 0) { "Red" } else { "Green" })
+Write-Host "  Granular violations: $($gdlpViolated.Count)" -ForegroundColor $(if ($gdlpViolated.Count -gt 0) { "Red" } else { "Green" })
+Write-Host "  ACP violations     : $($acpViolated.Count)"  -ForegroundColor $(if ($acpViolated.Count -gt 0) { "Red" } else { "Green" })
+Write-Host "  Impacted (total)   : $($impacted.Count)"     -ForegroundColor $(if ($impacted.Count -gt 0) { "Red" } else { "Green" })
+Write-Host "  Not impacted       : $($clean.Count)"        -ForegroundColor Green
 
 Write-Host ""
 Write-Host "  Cross-referencing DLP / Granular DLP / ACP:" -ForegroundColor Cyan
-Write-Host "    Solo DLP                 : $($xDlpOnly.Count)"
-Write-Host "    Solo Granular DLP        : $($xGdlpOnly.Count)"
-Write-Host "    Solo ACP                 : $($xAcpOnly.Count)"
+Write-Host "    DLP only                 : $($xDlpOnly.Count)"
+Write-Host "    Granular DLP only        : $($xGdlpOnly.Count)"
+Write-Host "    ACP only                 : $($xAcpOnly.Count)"
 Write-Host "    DLP + Granular DLP       : $($xDlpGdlp.Count)"
 Write-Host "    DLP + ACP                : $($xDlpAcp.Count)"
 Write-Host "    Granular DLP + ACP       : $($xGdlpAcp.Count)"
@@ -1305,26 +1325,26 @@ Write-Host "    DLP + Granular DLP + ACP : $($xAllThree.Count)" -ForegroundColor
 
 if ($violated.Count -gt 0) {
     Write-Host ""
-    Write-Host "  Dettaglio violazioni DLP:" -ForegroundColor Red
+    Write-Host "  DLP violations detail:" -ForegroundColor Red
     $violated | Format-Table EnvironmentName, ResourceType, ResourceName, Owner, ViolationReason -AutoSize
 }
 
 if ($gdlpViolated.Count -gt 0) {
     Write-Host ""
-    Write-Host "  Dettaglio violazioni Granular DLP (action control / endpoint filtering):" -ForegroundColor Red
+    Write-Host "  Granular DLP violations detail (action control / endpoint filtering):" -ForegroundColor Red
     $gdlpViolated | Format-Table EnvironmentName, ResourceType, ResourceName, Owner, GranularDlpViolationReason -AutoSize
 }
 
 if ($acpViolated.Count -gt 0) {
     Write-Host ""
-    Write-Host "  Dettaglio violazioni ACP (Advanced Connector Policies, default-deny):" -ForegroundColor Red
+    Write-Host "  ACP violations detail (Advanced Connector Policies, default-deny):" -ForegroundColor Red
     $acpViolated | Format-Table EnvironmentName, ResourceType, ResourceName, Owner, AcpViolationReason -AutoSize
 }
 
 $multiImpacted = @($results | Where-Object { $_.ImpactCount -gt 1 })
 if ($multiImpacted.Count -gt 0) {
     Write-Host ""
-    Write-Host "  Risorse impattate da piu' controlli contemporaneamente:" -ForegroundColor Red
+    Write-Host "  Resources impacted by multiple controls simultaneously:" -ForegroundColor Red
     $multiImpacted | Format-Table EnvironmentName, ResourceType, ResourceName, Owner, ImpactSources -AutoSize
 }
 
@@ -1332,6 +1352,6 @@ $outDir = Split-Path -Parent $OutputCsv
 if ($outDir -and -not (Test-Path $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
 $results | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
 Write-Host ""
-Write-Host "Report salvato in: $OutputCsv" -ForegroundColor Green
+Write-Host "Report saved to: $OutputCsv" -ForegroundColor Green
 Write-Host ""
 try { Stop-Transcript | Out-Null } catch { }
