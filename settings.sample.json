@@ -1,0 +1,11 @@
+{
+    "Auth": {
+        "TenantId":      "00000000-0000-0000-0000-000000000000",
+        "ApplicationId": "00000000-0000-0000-0000-000000000000",
+        "ClientSecret":  "your-client-secret-here"
+    },
+    "Output": {
+        "CsvFolder": "output",
+        "DebugFolder": "debug"
+    }
+}

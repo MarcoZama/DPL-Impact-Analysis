@@ -1,0 +1,9 @@
+# Credenziali reali (usare settings.sample.json come template)
+settings.json
+
+# Output e log
+output/
+debug/*.log
+
+# CSV generati
+*.csv
