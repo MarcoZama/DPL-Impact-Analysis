@@ -1,5 +1,6 @@
 # Credenziali reali (usare settings.sample.json come template)
 settings.json
+settings.local.json
 
 # Output e log
 output/

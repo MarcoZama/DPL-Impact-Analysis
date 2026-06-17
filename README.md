@@ -90,6 +90,91 @@ A resource is considered **in violation** when:
 Each connector is matched against the policy `connectorGroups` to determine its
 classification (`Business`, `NonBusiness`, `Blocked`, or `Unclassified`).
 
+### Granular DLP controls (action control / endpoint filtering)
+
+In addition to the connector-group classification, the script can evaluate the
+granular controls attached to a classic data policy:
+
+- **Connector action control** — allow/block of individual actions or triggers
+  within a connector (`connectorActionConfigurations`, with per-action
+  `Allow`/`Block` rules and a default behavior).
+- **Connector endpoint filtering** — allow/deny of specific hosts/URLs for the
+  six supported connectors: HTTP, HTTP with Microsoft Entra ID, HTTP Webhook,
+  SQL Server, Azure Blob Storage, and SMTP (`endpointConfigurations`, with
+  ordered `Allow`/`Deny` endpoint rules).
+
+These configurations are retrieved for the selected policy via
+`Get-PowerAppDlpPolicyConnectorConfigurations` and the raw object is dumped to
+the `debug` folder as `GranularDlp_ConnectorConfig_<timestamp>.json` for
+verification.
+
+For each Flow and Canvas App, the script extracts the operation IDs and the
+static endpoints used, and flags a resource as a Granular DLP violation when:
+
+- an action it uses is explicitly set to `Block`, or
+- a static endpoint it uses falls into a `Deny` endpoint rule.
+
+Limitations (reported as best-effort):
+
+- Endpoints expressed dynamically (variables/expressions) cannot be evaluated.
+- Default-deny of *new* actions is not flagged per resource (action-to-connector
+  association is not always resolvable from the resource definition).
+- Copilot Studio agents are not evaluated for Granular DLP
+  (`GranularDlpViolationReason` is set to `Granular DLP non valutato (agente)`);
+  they are still evaluated at the connector level.
+
+Granular DLP analysis is controlled from the `GranularDlp` section in the
+settings file and can be turned off entirely.
+
+### Advanced Connector Policies (ACP, default-deny allowlist)
+
+ACP are the newest construct: a **default-deny allowlist** of certified
+connectors, applied per-environment or inherited from an environment group. Any
+connector that is *not* on the allowlist is blocked.
+
+The script evaluates ACP impact as follows:
+
+1. It acquires a token for the Power Platform API
+   (`https://api.powerplatform.com`).
+2. For each selected environment it resolves the environment group (if any) and
+   runs a **discovery** against the candidate endpoints listed in
+   `Acp.DiscoveryEndpoints` (templated with `{environmentId}` / `{groupId}`).
+3. Every successful response is dumped raw to the `debug` folder as
+   `ACP_Discovery_<endpoint>_<timestamp>.json` so the real preview schema can be
+   confirmed for your tenant.
+4. The allowlist connector IDs are parsed defensively from the response, and a
+   resource is flagged as an ACP violation when it uses a connector that is
+   **not** present in the allowlist (default-deny).
+
+Limitations (reported as best-effort):
+
+- The endpoint that exposes the effective ACP allowlist is a **preview** feature
+  and is not part of the stable public REST reference; the candidate endpoints
+  are a starting point and may need adjusting once you inspect the dumped JSON.
+- ACP officially covers **certified connectors only** (custom and HTTP
+  connectors are not yet supported); custom/HTTP usage is evaluated on a
+  best-effort basis.
+- ACP is evaluated only when an allowlist is successfully discovered for the
+  environment; otherwise the resource is reported as not in ACP scope.
+
+ACP analysis is controlled from the `Acp` section in the settings file and can
+be turned off entirely.
+
+### Cross-referencing DLP / Granular DLP / ACP
+
+The three control levels are evaluated independently per resource and then
+combined into a single impact verdict:
+
+- `Impacted` is `True` when the resource is blocked by **at least one** of the
+  three controls.
+- `ImpactCount` is how many of the three controls block it (0–3).
+- `ImpactSources` lists which ones, e.g. `DLP + ACP` or `DLP + GranularDLP + ACP`.
+
+The console summary prints an overlap matrix (DLP only, Granular DLP only, ACP
+only, each pairwise combination, and all three) plus a dedicated table of the
+resources blocked by more than one control at the same time — the highest-risk
+items to remediate first.
+
 ## Output
 
 The script writes a CSV report and a debug transcript:
@@ -98,16 +183,21 @@ The script writes a CSV report and a debug transcript:
   `DLP_Impact_<timestamp>.csv`. Each row contains:
   `PolicyName`, `PolicyId`, `EnvironmentName`, `EnvironmentId`, `ResourceType`,
   `ResourceName`, `ResourceId`, `Owner`, `State`, `ConnectorsUsed`,
-  `ConnectorGroups`, `DlpViolation`, `ViolationReason`.
+  `ConnectorGroups`, `DlpViolation`, `ViolationReason`, `GranularDlpViolation`,
+  `GranularDlpViolationReason`, `AcpViolation`, `AcpViolationReason`,
+  `Impacted`, `ImpactCount`, `ImpactSources`.
 - **Debug log** — a full PowerShell transcript saved to the `debug` folder,
   named `DLP_Debug_<timestamp>.log`.
 
-A summary of total resources, violations, and unaffected resources is printed to
-the console at the end of the run.
+A summary of total resources, per-control violations, the cross-referencing
+overlap matrix, and unaffected resources is printed to the console at the end of
+the run.
 
 ## Configuration
 
-Configuration is read from `settings.json` (copy `settings.sample.json` to start):
+Configuration is read from a settings file. The scripts prefer
+`settings.local.json` and fall back to `settings.json`. Copy
+`settings.sample.json` to `settings.local.json` and fill in your values:
 
 ```json
 {
@@ -119,6 +209,20 @@ Configuration is read from `settings.json` (copy `settings.sample.json` to start
     "Output": {
         "CsvFolder": "output",
         "DebugFolder": "debug"
+    },
+    "GranularDlp": {
+        "Enabled": true,
+        "AnalyzeActionControl": true,
+        "AnalyzeEndpointFiltering": true
+    },
+    "Acp": {
+        "Enabled": true,
+        "DefaultDeny": true,
+        "DiscoveryEndpoints": [
+            "https://api.powerplatform.com/environmentmanagement/environmentGroups/{groupId}?api-version=2024-10-01",
+            "https://api.powerplatform.com/governance/environmentGroups/{groupId}/ruleSets?api-version=2024-10-01",
+            "https://api.powerplatform.com/governance/environments/{environmentId}/connectorPolicies?api-version=2024-10-01"
+        ]
     }
 }
 ```
@@ -130,9 +234,16 @@ Configuration is read from `settings.json` (copy `settings.sample.json` to start
 | `Auth.ClientSecret` | Client secret of the SPN. |
 | `Output.CsvFolder` | Folder for the CSV reports. Relative paths resolve against the script folder. |
 | `Output.DebugFolder` | Folder for the debug transcript logs. |
+| `GranularDlp.Enabled` | Master switch for granular DLP (action control / endpoint filtering) analysis. |
+| `GranularDlp.AnalyzeActionControl` | Evaluate per-action `Allow`/`Block` rules. |
+| `GranularDlp.AnalyzeEndpointFiltering` | Evaluate endpoint `Allow`/`Deny` rules. |
+| `Acp.Enabled` | Master switch for Advanced Connector Policies (default-deny allowlist) analysis. |
+| `Acp.DefaultDeny` | Treat connectors not on the discovered allowlist as blocked. |
+| `Acp.DiscoveryEndpoints` | Candidate Power Platform API endpoints probed to discover the ACP allowlist (templated with `{environmentId}` / `{groupId}`). |
 
-`settings.json` is excluded from source control via `.gitignore` because it holds
-real credentials. Keep the secret only in your local copy.
+Both `settings.json` and `settings.local.json` are excluded from source control
+via `.gitignore` because they hold real credentials. Keep secrets only in your
+local copy.
 
 ## Prerequisites
 
@@ -147,8 +258,8 @@ real credentials. Keep the secret only in your local copy.
 ## Usage
 
 ```powershell
-# 1. Create your settings file and fill in real credentials
-Copy-Item settings.sample.json settings.json
+# 1. Create your local settings file and fill in real credentials
+Copy-Item settings.sample.json settings.local.json
 
 # 2. One-time: register the SPN in all environments
 .\Setup-SPNPermissions.ps1
@@ -179,8 +290,9 @@ Copy-Item settings.sample.json settings.json
 ```
 Analyze-DLPImpact.ps1      Main analysis script
 Setup-SPNPermissions.ps1   One-time SPN registration
-settings.json              Local credentials (git-ignored)
-settings.sample.json       Template for settings.json
+settings.local.json        Local credentials, preferred (git-ignored)
+settings.json              Local credentials, fallback (git-ignored)
+settings.sample.json       Template for the settings file
 output/                    Generated CSV reports
 debug/                     Debug transcript logs and Debug-BotConnectors.ps1
 ```

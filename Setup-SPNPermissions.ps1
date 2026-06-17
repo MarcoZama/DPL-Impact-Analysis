@@ -17,11 +17,13 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------------------
-# Caricamento settings.json
+# Caricamento settings (preferisce settings.local.json, poi settings.json)
 # ---------------------------------------------------------------------------
-$settingsFile = Join-Path $PSScriptRoot "settings.json"
-if (-not (Test-Path $settingsFile)) {
-    Write-Error "File settings.json non trovato. Copiare settings.sample.json e compilarlo."
+$settingsFile = @("settings.local.json", "settings.json") |
+    ForEach-Object { Join-Path $PSScriptRoot $_ } |
+    Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $settingsFile) {
+    Write-Error "File settings non trovato. Copiare settings.sample.json in settings.local.json e compilarlo."
 }
 
 $cfg           = Get-Content $settingsFile -Raw | ConvertFrom-Json

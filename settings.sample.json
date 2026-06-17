@@ -7,5 +7,19 @@
     "Output": {
         "CsvFolder": "output",
         "DebugFolder": "debug"
+    },
+    "GranularDlp": {
+        "Enabled": true,
+        "AnalyzeActionControl": true,
+        "AnalyzeEndpointFiltering": true
+    },
+    "Acp": {
+        "Enabled": true,
+        "DefaultDeny": true,
+        "DiscoveryEndpoints": [
+            "https://api.powerplatform.com/environmentmanagement/environmentGroups/{groupId}?api-version=2024-10-01",
+            "https://api.powerplatform.com/governance/environmentGroups/{groupId}/ruleSets?api-version=2024-10-01",
+            "https://api.powerplatform.com/governance/environments/{environmentId}/connectorPolicies?api-version=2024-10-01"
+        ]
     }
 }

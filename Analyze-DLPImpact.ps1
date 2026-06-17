@@ -42,20 +42,47 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------------------
-# Caricamento settings.json
+# Caricamento settings (preferisce settings.local.json, poi settings.json)
 # ---------------------------------------------------------------------------
-$settingsFile = Join-Path $PSScriptRoot "settings.json"
-if (Test-Path $settingsFile) {
+$cfg = $null
+# Granular DLP = action control + endpoint filtering delle policy DLP classiche
+$GranularDlpEnabled    = $true
+$GranularDlpActions    = $true
+$GranularDlpEndpoints  = $true
+# ACP = vere Advanced Connector Policies (default-deny allowlist, per-environment/group)
+$AcpEnabled            = $true
+$AcpDefaultDeny        = $true
+$AcpDiscoveryEndpoints = @()
+$settingsFile = @("settings.local.json", "settings.json") |
+    ForEach-Object { Join-Path $PSScriptRoot $_ } |
+    Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($settingsFile) {
     $cfg = Get-Content $settingsFile -Raw | ConvertFrom-Json
-    if (-not $TenantId      -and $cfg.Auth.TenantId      -notmatch '^0+(-0+)+$') { $TenantId      = $cfg.Auth.TenantId }
-    if (-not $ApplicationId -and $cfg.Auth.ApplicationId -notmatch '^0+(-0+)+$') { $ApplicationId = $cfg.Auth.ApplicationId }
-    if (-not $ClientSecret  -and $cfg.Auth.ClientSecret  -ne "your-client-secret-here") { $ClientSecret = $cfg.Auth.ClientSecret }
+    if (-not $TenantId      -and $cfg.Auth.TenantId      -notmatch '^0+(-0+)+$' -and $cfg.Auth.TenantId      -notmatch '^PASTE') { $TenantId      = $cfg.Auth.TenantId }
+    if (-not $ApplicationId -and $cfg.Auth.ApplicationId -notmatch '^0+(-0+)+$' -and $cfg.Auth.ApplicationId -notmatch '^PASTE') { $ApplicationId = $cfg.Auth.ApplicationId }
+    if (-not $ClientSecret  -and $cfg.Auth.ClientSecret  -ne "your-client-secret-here" -and $cfg.Auth.ClientSecret -notmatch '^PASTE') { $ClientSecret = $cfg.Auth.ClientSecret }
     if (-not $OutputCsv) {
         $folder    = if ($cfg.Output.CsvFolder) { $cfg.Output.CsvFolder } else { "." }
         if (-not [System.IO.Path]::IsPathRooted($folder)) { $folder = Join-Path $PSScriptRoot $folder }
         $OutputCsv = Join-Path $folder "DLP_Impact_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
     }
     if (-not $DebugFolder -and $cfg.Output.DebugFolder) { $DebugFolder = $cfg.Output.DebugFolder }
+
+    $gdProp = $cfg.PSObject.Properties['GranularDlp']
+    if ($gdProp -and $gdProp.Value) {
+        $gd = $gdProp.Value
+        $p = $gd.PSObject.Properties['Enabled'];                  if ($p) { $GranularDlpEnabled   = [bool]$p.Value }
+        $p = $gd.PSObject.Properties['AnalyzeActionControl'];     if ($p) { $GranularDlpActions   = [bool]$p.Value }
+        $p = $gd.PSObject.Properties['AnalyzeEndpointFiltering']; if ($p) { $GranularDlpEndpoints = [bool]$p.Value }
+    }
+
+    $acpProp = $cfg.PSObject.Properties['Acp']
+    if ($acpProp -and $acpProp.Value) {
+        $acpCfg = $acpProp.Value
+        $p = $acpCfg.PSObject.Properties['Enabled'];            if ($p) { $AcpEnabled     = [bool]$p.Value }
+        $p = $acpCfg.PSObject.Properties['DefaultDeny'];        if ($p) { $AcpDefaultDeny = [bool]$p.Value }
+        $p = $acpCfg.PSObject.Properties['DiscoveryEndpoints']; if ($p -and $p.Value) { $AcpDiscoveryEndpoints = @($p.Value) }
+    }
 }
 if (-not $OutputCsv) { $OutputCsv = ".\DLP_Impact_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv" }
 if (-not $DebugFolder) { $DebugFolder = "debug" }
@@ -565,6 +592,286 @@ function Get-ViolationReason {
 }
 
 # ---------------------------------------------------------------------------
+# Helpers — Granular DLP (connector action control + endpoint filtering)
+# delle policy DLP CLASSICHE. NB: NON sono le Advanced Connector Policies (ACP),
+# che sono gestite separatamente piu' sotto.
+# ---------------------------------------------------------------------------
+
+function Get-GranularDlpConfigurations {
+    # Recupera le "connector configurations" della policy classica selezionata:
+    #   - connectorActionConfigurations -> action control (Allow/Block per azione)
+    #   - endpointConfigurations        -> endpoint filtering (Allow/Deny per host/URL)
+    # Salva un dump JSON grezzo nella cartella debug per verifica/diagnostica.
+    param([string]$TenantId, [string]$PolicyName, [string]$DebugFolder)
+
+    $result = [pscustomobject]@{
+        Available          = $false
+        Actions            = @{}    # connectorKey -> @{ Default; Rules=@{actionId=behavior} }
+        Endpoints          = @{}    # connectorKey -> @( @{ Order; Endpoint; Behavior } )
+        ActionConnectors   = 0
+        EndpointConnectors = 0
+    }
+
+    $cmd = Get-Command Get-PowerAppDlpPolicyConnectorConfigurations -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        Write-Host "  Cmdlet 'Get-PowerAppDlpPolicyConnectorConfigurations' non disponibile — ACP non analizzabili." -ForegroundColor DarkYellow
+        return $result
+    }
+
+    try {
+        $raw = Get-PowerAppDlpPolicyConnectorConfigurations -TenantId $TenantId -PolicyName $PolicyName -ErrorAction Stop
+    } catch {
+        Write-Host "  Nessuna connector configuration (ACP) per questa policy." -ForegroundColor DarkGray
+        return $result
+    }
+    if (-not $raw) { return $result }
+
+    # Dump grezzo a scopo diagnostico
+    try {
+        if ($DebugFolder) {
+            $dump = Join-Path $DebugFolder "GranularDlp_ConnectorConfig_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+            $raw | ConvertTo-Json -Depth 25 | Set-Content -Path $dump -Encoding UTF8
+        }
+    } catch {}
+
+    # Action control
+    $acProp = $raw.PSObject.Properties['connectorActionConfigurations']
+    if ($acProp -and $acProp.Value) {
+        foreach ($c in @($acProp.Value)) {
+            $cid = [string](Get-Prop $c 'connectorId'); if ($cid) { $cid = (($cid -split '/')[-1]).ToLowerInvariant() }
+            if (-not $cid) { continue }
+            $rules = @{}
+            $ar = Get-Prop $c 'actionRules'
+            if ($ar) { foreach ($r in @($ar)) { $aid = Get-Prop $r 'actionId'; if ($aid) { $rules[$aid] = [string](Get-Prop $r 'behavior') } } }
+            $def = [string](Get-Prop $c 'defaultConnectorActionRuleBehavior'); if (-not $def) { $def = "Allow" }
+            $result.Actions[$cid] = [pscustomobject]@{ Default = $def; Rules = $rules }
+        }
+        $result.ActionConnectors = $result.Actions.Count
+    }
+
+    # Endpoint filtering
+    $epProp = $raw.PSObject.Properties['endpointConfigurations']
+    if ($epProp -and $epProp.Value) {
+        foreach ($c in @($epProp.Value)) {
+            $cid = [string](Get-Prop $c 'connectorId'); if ($cid) { $cid = (($cid -split '/')[-1]).ToLowerInvariant() }
+            if (-not $cid) { continue }
+            $list = @()
+            $er = Get-Prop $c 'endpointRules'
+            if ($er) {
+                foreach ($r in @($er)) {
+                    $list += [pscustomobject]@{
+                        Order    = [int](Get-Prop $r 'order')
+                        Endpoint = [string](Get-Prop $r 'endpoint')
+                        Behavior = [string](Get-Prop $r 'behavior')
+                    }
+                }
+            }
+            $result.Endpoints[$cid] = @($list)
+        }
+        $result.EndpointConnectors = $result.Endpoints.Count
+    }
+
+    if ($result.ActionConnectors -gt 0 -or $result.EndpointConnectors -gt 0) { $result.Available = $true }
+    return $result
+}
+
+function Get-ActionIdsFromText {
+    # Estrae gli operationId (azioni/trigger) referenziati in un clientdata/definizione risorsa.
+    param([string]$Text)
+    if (-not $Text) { return @() }
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($m in [regex]::Matches($Text, '(?i)"(?:operationId|swaggerOperationId)"\s*:\s*"([^"]+)"')) { [void]$set.Add($m.Groups[1].Value) }
+    foreach ($m in [regex]::Matches($Text, '(?im)^\s*operationId\s*:\s*[''"]?([A-Za-z0-9_]+)')) { [void]$set.Add($m.Groups[1].Value) }
+    return @($set)
+}
+
+function Get-EndpointsFromText {
+    # Estrae (best-effort) gli endpoint statici usati: server SQL/SMTP, URL HTTP, host.
+    # Gli endpoint dinamici (variabili/espressioni) NON sono rilevabili.
+    param([string]$Text)
+    if (-not $Text) { return @() }
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($m in [regex]::Matches($Text, '(?i)"(?:uri|url|host|server|serverName|databaseName|address)"\s*:\s*"([^"@{}]+)"')) { [void]$set.Add($m.Groups[1].Value) }
+    foreach ($m in [regex]::Matches($Text, '(?i)https?://[^\s"''<>]+')) { [void]$set.Add($m.Value.TrimEnd('/')) }
+    return @($set)
+}
+
+function Resolve-EndpointBehavior {
+    # Applica le endpoint rule (in ordine crescente) al primo match; supporta wildcard '*'.
+    param([string]$Endpoint, [object[]]$Rules)
+    $sorted = @($Rules | Sort-Object { $_.Order })
+    foreach ($r in $sorted) {
+        if (-not $r.Endpoint) { continue }
+        $pat = [regex]::Escape($r.Endpoint) -replace '\\\*', '.*'
+        if ($Endpoint -match "^$pat$") { return $r.Behavior }
+    }
+    return $null
+}
+
+function Test-GranularDlpViolation {
+    # Valuta action control + endpoint filtering per una singola risorsa.
+    # Restituisce solo violazioni "certe": azione esplicitamente bloccata effettivamente
+    # usata, oppure endpoint statico che ricade in una regola Deny.
+    param(
+        [string]$Text, [string[]]$ConnectorIds, [object]$Acp,
+        [bool]$AnalyzeActions = $true, [bool]$AnalyzeEndpoints = $true
+    )
+    if (-not $Acp -or -not $Acp.Available) { return [pscustomobject]@{ Violated = $false; Reason = "" } }
+
+    $violated = $false
+    $reasons  = @()
+    $connKeys = @($ConnectorIds | ForEach-Object { (($_ -split '/')[-1]).ToLowerInvariant() } | Sort-Object -Unique)
+
+    if ($AnalyzeActions -and $Acp.Actions.Count -gt 0) {
+        $usedActions = Get-ActionIdsFromText $Text
+        if ($usedActions.Count -gt 0) {
+            foreach ($ck in $connKeys) {
+                if ($Acp.Actions.ContainsKey($ck)) {
+                    $conf = $Acp.Actions[$ck]
+                    $blockedUsed = @($usedActions | Where-Object { $conf.Rules.ContainsKey($_) -and $conf.Rules[$_] -match '(?i)Block|Deny' })
+                    if ($blockedUsed.Count -gt 0) {
+                        $violated = $true
+                        $reasons += "Azione bloccata su ${ck}: $($blockedUsed -join ', ')"
+                    }
+                }
+            }
+        }
+    }
+
+    if ($AnalyzeEndpoints -and $Acp.Endpoints.Count -gt 0) {
+        $usedEndpoints = Get-EndpointsFromText $Text
+        if ($usedEndpoints.Count -gt 0) {
+            foreach ($ck in $connKeys) {
+                if ($Acp.Endpoints.ContainsKey($ck)) {
+                    foreach ($ep in $usedEndpoints) {
+                        $beh = Resolve-EndpointBehavior -Endpoint $ep -Rules $Acp.Endpoints[$ck]
+                        if ($beh -match '(?i)Deny|Block') {
+                            $violated = $true
+                            $reasons += "Endpoint negato su ${ck}: $ep"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return [pscustomobject]@{ Violated = $violated; Reason = ($reasons -join ' | ') }
+}
+
+# ---------------------------------------------------------------------------
+# Helpers — ACP (vere Advanced Connector Policies)
+# Modello default-deny allowlist, configurate per-environment o via environment
+# group. API in preview (Power Platform API, audience https://api.powerplatform.com):
+# l'endpoint che espone l'allowlist effettiva NON e' nel riferimento REST pubblico
+# stabile, quindi qui si usa una DISCOVERY su endpoint candidati con dump grezzo.
+# ---------------------------------------------------------------------------
+
+function Get-AcpToken {
+    # Access token per la Power Platform API (riusa il refresh token admin).
+    try { return Get-TokenForResource -Resource "https://api.powerplatform.com" }
+    catch { Write-Host "    ACP: impossibile ottenere token Power Platform API: $_" -ForegroundColor DarkYellow; return $null }
+}
+
+function Get-EnvAcpAllowlist {
+    # Recupera (best-effort, via discovery) l'allowlist ACP effettiva per un environment.
+    # Ritorna: @{ Available; Allow=HashSet<connectorKey>; Source; RawCount }
+    param(
+        [string]$EnvironmentId,
+        [string]$EnvironmentGroupId,
+        [string]$AcpToken,
+        [string[]]$Endpoints,
+        [string]$DebugFolder
+    )
+
+    $allow  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $result = [pscustomobject]@{ Available = $false; Allow = $allow; Source = ""; RawCount = 0 }
+    if (-not $AcpToken) { return $result }
+    if (-not $Endpoints -or $Endpoints.Count -eq 0) { return $result }
+
+    $headers = @{ Authorization = "Bearer $AcpToken"; "Content-Type" = "application/json" }
+
+    foreach ($tpl in $Endpoints) {
+        if ([string]::IsNullOrWhiteSpace($tpl)) { continue }
+        # Salta i template che richiedono un groupId quando l'env non e' in un gruppo
+        if ($tpl -match '\{groupId\}' -and -not $EnvironmentGroupId) { continue }
+        $url = $tpl.Replace('{environmentId}', $EnvironmentId).Replace('{groupId}', [string]$EnvironmentGroupId)
+
+        try {
+            $resp = Invoke-RestMethod -Method Get -Uri $url -Headers $headers -ErrorAction Stop
+        } catch {
+            $code = $null
+            try { $code = $_.Exception.Response.StatusCode.value__ } catch {}
+            Write-Host "    ACP discovery: $url -> $(if ($code) { "HTTP $code" } else { 'errore' })" -ForegroundColor DarkGray
+            continue
+        }
+        if (-not $resp) { continue }
+
+        # Dump grezzo per verifica dello schema reale (preview)
+        try {
+            if ($DebugFolder) {
+                $safe = ($url -replace '[^A-Za-z0-9]+', '_')
+                if ($safe.Length -gt 80) { $safe = $safe.Substring(0, 80) }
+                $dump = Join-Path $DebugFolder "ACP_Discovery_${safe}_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+                $resp | ConvertTo-Json -Depth 30 | Set-Content -Path $dump -Encoding UTF8
+            }
+        } catch {}
+
+        # Parsing difensivo dell'allowlist: raccoglie gli ID/nome connettore presenti
+        # nella risposta. Lo schema esatto va confermato sul dump del tuo tenant.
+        $json = $null
+        try { $json = $resp | ConvertTo-Json -Depth 30 } catch {}
+        if ($json) {
+            $before = $allow.Count
+            foreach ($m in [regex]::Matches($json, '(?i)/providers/Microsoft\.PowerApps/apis/(shared_[a-z0-9_]+)')) { [void]$allow.Add($m.Groups[1].Value.ToLowerInvariant()) }
+            foreach ($m in [regex]::Matches($json, '(?i)"(?:connectorId|connectorName|apiName|id|name)"\s*:\s*"(?:[^"]*\/)?(shared_[a-z0-9_]+)"')) { [void]$allow.Add($m.Groups[1].Value.ToLowerInvariant()) }
+            if ($allow.Count -gt $before) {
+                $result.Available = $true
+                $result.Source    = $url
+            }
+        }
+    }
+
+    $result.RawCount = $allow.Count
+    return $result
+}
+
+function Test-AcpViolation {
+    # Default-deny: ogni connettore usato che NON e' nell'allowlist ACP e' bloccato.
+    param([string[]]$ConnectorIds, [object]$AcpEnv)
+    if (-not $AcpEnv -or -not $AcpEnv.Available) { return [pscustomobject]@{ Violated = $false; Reason = "" } }
+    if (-not $ConnectorIds -or $ConnectorIds.Count -eq 0) { return [pscustomobject]@{ Violated = $false; Reason = "" } }
+
+    $blocked = @()
+    foreach ($cid in $ConnectorIds) {
+        $key = (($cid -split '/')[-1]).ToLowerInvariant()
+        if (-not $AcpEnv.Allow.Contains($key)) { $blocked += $key }
+    }
+    $blocked = @($blocked | Sort-Object -Unique)
+    if ($blocked.Count -gt 0) {
+        return [pscustomobject]@{ Violated = $true; Reason = "Connettori non in allowlist ACP (default-deny): $($blocked -join ', ')" }
+    }
+    return [pscustomobject]@{ Violated = $false; Reason = "" }
+}
+
+# ---------------------------------------------------------------------------
+# Helpers — Cross-referencing DLP / Granular DLP / ACP
+# Combina i tre livelli di controllo in un unico verdetto di impatto.
+# ---------------------------------------------------------------------------
+
+function Get-CombinedImpact {
+    param([bool]$Dlp, [bool]$GranularDlp, [bool]$Acp)
+    $sources = @()
+    if ($Dlp)         { $sources += "DLP" }
+    if ($GranularDlp) { $sources += "GranularDLP" }
+    if ($Acp)         { $sources += "ACP" }
+    return [pscustomobject]@{
+        Impacted      = ($sources.Count -gt 0)
+        ImpactCount   = $sources.Count
+        ImpactSources = ($sources -join " + ")
+    }
+}
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
@@ -681,6 +988,34 @@ Write-Host "  Policy selezionata : $($selectedPolicy.DisplayName)" -ForegroundCo
 Write-Host "  Scope              : $policyScope"                   -ForegroundColor DarkGray
 Write-Host "  Connettori Business: $businessCount | NonBusiness: $nonBizCount | Blocked: $blockedCount" -ForegroundColor DarkGray
 
+# STEP 5a-bis — Recupero Granular DLP (action control + endpoint filtering) della policy
+$granularDlp = [pscustomobject]@{ Available = $false; Actions = @{}; Endpoints = @{}; ActionConnectors = 0; EndpointConnectors = 0 }
+if ($GranularDlpEnabled) {
+    Write-Host ""
+    Write-Host "  Recupero Granular DLP (action control / endpoint filtering)..." -ForegroundColor Cyan
+    $granularDlp = Get-GranularDlpConfigurations -TenantId $TenantId -PolicyName $selectedPolicy.PolicyName -DebugFolder $DebugFolder
+    if ($granularDlp.Available) {
+        Write-Host "  Granular DLP attive — Action control: $($granularDlp.ActionConnectors) connettori | Endpoint filtering: $($granularDlp.EndpointConnectors) connettori" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Nessuna regola Granular DLP trovata per questa policy." -ForegroundColor DarkGray
+    }
+} else {
+    Write-Host "  Analisi Granular DLP disabilitata da settings (GranularDlp.Enabled = false)." -ForegroundColor DarkGray
+}
+
+# STEP 5a-ter — Token Power Platform API per le vere Advanced Connector Policies (ACP)
+$acpToken = $null
+if ($AcpEnabled) {
+    Write-Host ""
+    Write-Host "  Analisi ACP (Advanced Connector Policies, default-deny) abilitata." -ForegroundColor Cyan
+    $acpToken = Get-AcpToken
+    if (-not $acpToken) {
+        Write-Host "  ACP: token non disponibile, analisi ACP saltata." -ForegroundColor DarkYellow
+    }
+} else {
+    Write-Host "  Analisi ACP disabilitata da settings (Acp.Enabled = false)." -ForegroundColor DarkGray
+}
+
 # STEP 5b — Analisi impatto su tutti gli environment selezionati
 $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 
@@ -692,6 +1027,27 @@ foreach ($env in $selectedEnvs) {
     Write-Host "  Analisi: $envName" -ForegroundColor Cyan
 
     $instanceUrl = $env.properties.linkedEnvironmentMetadata.instanceUrl
+
+    # ACP — risoluzione allowlist (default-deny) per questo environment
+    $acpEnv = [pscustomobject]@{ Available = $false; Allow = $null; Source = ""; RawCount = 0 }
+    if ($AcpEnabled -and $acpToken) {
+        $envGroupId = $null
+        $propsObj = Get-Prop $env 'properties'
+        if ($propsObj) {
+            $pg = $propsObj.PSObject.Properties['parentEnvironmentGroup']
+            if ($pg -and $pg.Value) { $envGroupId = (Get-Prop $pg.Value 'id') }
+            if (-not $envGroupId) {
+                $eg = $propsObj.PSObject.Properties['environmentGroup']
+                if ($eg -and $eg.Value) { $envGroupId = (Get-Prop $eg.Value 'id') }
+            }
+        }
+        $acpEnv = Get-EnvAcpAllowlist -EnvironmentId $envId -EnvironmentGroupId $envGroupId -AcpToken $acpToken -Endpoints $AcpDiscoveryEndpoints -DebugFolder $DebugFolder
+        if ($acpEnv.Available) {
+            Write-Host "  ACP attiva per questo environment — $($acpEnv.RawCount) connettori in allowlist (default-deny)" -ForegroundColor Yellow
+        } else {
+            Write-Host "  Nessuna ACP rilevata per questo environment (discovery)." -ForegroundColor DarkGray
+        }
+    }
 
     # Flow e App via Dataverse (workflows table, category=5) — API non deprecata
     $dvH   = if ($instanceUrl) { Get-DataverseHeaders -InstanceUrl $instanceUrl } else { $null }
@@ -767,6 +1123,9 @@ foreach ($env in $selectedEnvs) {
                         ResourceType="Flow"; ResourceName=$flow.name; ResourceId=$flow.workflowid
                         Owner=""; State=if($flow.statecode -eq 1){"Active"}else{"Inactive"}
                         ConnectorsUsed=""; ConnectorGroups=""; DlpViolation=$false; ViolationReason="Nessun connettore rilevato"
+                        GranularDlpViolation=$false; GranularDlpViolationReason=""
+                        AcpViolation=$false; AcpViolationReason=""
+                        Impacted=$false; ImpactCount=0; ImpactSources=""
                     })
                 }
                 continue
@@ -774,6 +1133,9 @@ foreach ($env in $selectedEnvs) {
 
             $ownerUpn = Get-BotOwnerUpn -OwnerId $flow._ownerid_value -InstanceUrl $instanceUrl
             $violated = Test-DlpViolation -ConnectorIds $connIds -Policy $selectedPolicy
+            $gdlpRes  = Test-GranularDlpViolation -Text $flow.clientdata -ConnectorIds $connIds -Acp $granularDlp -AnalyzeActions $GranularDlpActions -AnalyzeEndpoints $GranularDlpEndpoints
+            $acpRes   = Test-AcpViolation -ConnectorIds $connIds -AcpEnv $acpEnv
+            $impact   = Get-CombinedImpact -Dlp $violated -GranularDlp $gdlpRes.Violated -Acp $acpRes.Violated
             $results.Add([PSCustomObject]@{
                 PolicyName      = $selectedPolicy.DisplayName
                 PolicyId        = $selectedPolicy.PolicyName
@@ -788,6 +1150,13 @@ foreach ($env in $selectedEnvs) {
                 ConnectorGroups = ($connIds | ForEach-Object { "$(Get-ConnectorName $_ $selectedPolicy)=$(Get-ConnectorGroup $_ $selectedPolicy)" }) -join "; "
                 DlpViolation    = $violated
                 ViolationReason = if ($violated) { Get-ViolationReason $connIds $selectedPolicy } else { "" }
+                GranularDlpViolation       = $gdlpRes.Violated
+                GranularDlpViolationReason = $gdlpRes.Reason
+                AcpViolation    = $acpRes.Violated
+                AcpViolationReason = $acpRes.Reason
+                Impacted        = $impact.Impacted
+                ImpactCount     = $impact.ImpactCount
+                ImpactSources   = $impact.ImpactSources
             })
         } catch { Write-Warning "    Flow '$($flow.name)': $_" }
     }
@@ -816,6 +1185,9 @@ foreach ($env in $selectedEnvs) {
                         ResourceType="PowerApp"; ResourceName=$app.name; ResourceId=$app.workflowid
                         Owner=""; State=if($app.statecode -eq 1){"Active"}else{"Inactive"}
                         ConnectorsUsed=""; ConnectorGroups=""; DlpViolation=$false; ViolationReason="Nessun connettore rilevato"
+                        GranularDlpViolation=$false; GranularDlpViolationReason=""
+                        AcpViolation=$false; AcpViolationReason=""
+                        Impacted=$false; ImpactCount=0; ImpactSources=""
                     })
                 }
                 continue
@@ -823,6 +1195,9 @@ foreach ($env in $selectedEnvs) {
 
             $ownerUpn = Get-BotOwnerUpn -OwnerId $app._ownerid_value -InstanceUrl $instanceUrl
             $violated = Test-DlpViolation -ConnectorIds $connIds -Policy $selectedPolicy
+            $gdlpRes  = Test-GranularDlpViolation -Text $app.clientdata -ConnectorIds $connIds -Acp $granularDlp -AnalyzeActions $GranularDlpActions -AnalyzeEndpoints $GranularDlpEndpoints
+            $acpRes   = Test-AcpViolation -ConnectorIds $connIds -AcpEnv $acpEnv
+            $impact   = Get-CombinedImpact -Dlp $violated -GranularDlp $gdlpRes.Violated -Acp $acpRes.Violated
             $results.Add([PSCustomObject]@{
                 PolicyName      = $selectedPolicy.DisplayName
                 PolicyId        = $selectedPolicy.PolicyName
@@ -837,6 +1212,13 @@ foreach ($env in $selectedEnvs) {
                 ConnectorGroups = ($connIds | ForEach-Object { "$(Get-ConnectorName $_ $selectedPolicy)=$(Get-ConnectorGroup $_ $selectedPolicy)" }) -join "; "
                 DlpViolation    = $violated
                 ViolationReason = if ($violated) { Get-ViolationReason $connIds $selectedPolicy } else { "" }
+                GranularDlpViolation       = $gdlpRes.Violated
+                GranularDlpViolationReason = $gdlpRes.Reason
+                AcpViolation    = $acpRes.Violated
+                AcpViolationReason = $acpRes.Reason
+                Impacted        = $impact.Impacted
+                ImpactCount     = $impact.ImpactCount
+                ImpactSources   = $impact.ImpactSources
             })
         } catch { Write-Warning "    App '$($app.name)': $_" }
     }
@@ -850,6 +1232,8 @@ foreach ($env in $selectedEnvs) {
             $connIds = @(Get-BotConnectorIds -BotId $bot.botid -InstanceUrl $instanceUrl)
             $ownerUpn = Get-BotOwnerUpn -OwnerId $bot._ownerid_value -InstanceUrl $instanceUrl
             $violated = if ($connIds) { Test-DlpViolation -ConnectorIds $connIds -Policy $selectedPolicy } else { $false }
+            $acpRes   = if ($connIds) { Test-AcpViolation -ConnectorIds $connIds -AcpEnv $acpEnv } else { [pscustomobject]@{ Violated = $false; Reason = "" } }
+            $impact   = Get-CombinedImpact -Dlp $violated -GranularDlp $false -Acp $acpRes.Violated
             $results.Add([PSCustomObject]@{
                 PolicyName      = $selectedPolicy.DisplayName
                 PolicyId        = $selectedPolicy.PolicyName
@@ -864,6 +1248,13 @@ foreach ($env in $selectedEnvs) {
                 ConnectorGroups = ($connIds | ForEach-Object { "$(Get-ConnectorName $_ $selectedPolicy)=$(Get-ConnectorGroup $_ $selectedPolicy)" }) -join "; "
                 DlpViolation    = $violated
                 ViolationReason = if ($violated) { Get-ViolationReason $connIds $selectedPolicy } else { "" }
+                GranularDlpViolation       = $false
+                GranularDlpViolationReason = "Granular DLP non valutato (agente)"
+                AcpViolation    = $acpRes.Violated
+                AcpViolationReason = $acpRes.Reason
+                Impacted        = $impact.Impacted
+                ImpactCount     = $impact.ImpactCount
+                ImpactSources   = $impact.ImpactSources
             })
         } catch { Write-Warning "    Agente '$($bot.name)': $_" }
     }
@@ -875,22 +1266,66 @@ foreach ($env in $selectedEnvs) {
 # Output & riepilogo
 # ---------------------------------------------------------------------------
 $violated = @($results | Where-Object { $_.DlpViolation -eq $true })
-$clean    = @($results | Where-Object { $_.DlpViolation -eq $false })
+$gdlpViolated = @($results | Where-Object { $_.GranularDlpViolation -eq $true })
+$acpViolated  = @($results | Where-Object { $_.AcpViolation -eq $true })
+$impacted = @($results | Where-Object { $_.Impacted -eq $true })
+$clean    = @($results | Where-Object { $_.Impacted -eq $false })
+
+# Cross-referencing: sovrapposizioni tra i tre livelli di controllo
+$xDlpOnly  = @($results | Where-Object { $_.DlpViolation -and -not $_.GranularDlpViolation -and -not $_.AcpViolation })
+$xGdlpOnly = @($results | Where-Object { $_.GranularDlpViolation -and -not $_.DlpViolation -and -not $_.AcpViolation })
+$xAcpOnly  = @($results | Where-Object { $_.AcpViolation -and -not $_.DlpViolation -and -not $_.GranularDlpViolation })
+$xDlpGdlp  = @($results | Where-Object { $_.DlpViolation -and $_.GranularDlpViolation -and -not $_.AcpViolation })
+$xDlpAcp   = @($results | Where-Object { $_.DlpViolation -and $_.AcpViolation -and -not $_.GranularDlpViolation })
+$xGdlpAcp  = @($results | Where-Object { $_.GranularDlpViolation -and $_.AcpViolation -and -not $_.DlpViolation })
+$xAllThree = @($results | Where-Object { $_.DlpViolation -and $_.GranularDlpViolation -and $_.AcpViolation })
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "   RIEPILOGO" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  Policy         : $($selectedPolicy.DisplayName)"
-Write-Host "  Environment    : $(($selectedEnvs | ForEach-Object { $_.properties.displayName }) -join ', ')"
-Write-Host "  Risorse totali : $($results.Count)"
-Write-Host "  Violazioni DLP : $($violated.Count)" -ForegroundColor $(if ($violated.Count -gt 0) { "Red" } else { "Green" })
-Write-Host "  Non impattate  : $($clean.Count)"    -ForegroundColor Green
+Write-Host "  Policy             : $($selectedPolicy.DisplayName)"
+Write-Host "  Environment        : $(($selectedEnvs | ForEach-Object { $_.properties.displayName }) -join ', ')"
+Write-Host "  Risorse totali     : $($results.Count)"
+Write-Host "  Violazioni DLP     : $($violated.Count)"     -ForegroundColor $(if ($violated.Count -gt 0) { "Red" } else { "Green" })
+Write-Host "  Violazioni Granular: $($gdlpViolated.Count)" -ForegroundColor $(if ($gdlpViolated.Count -gt 0) { "Red" } else { "Green" })
+Write-Host "  Violazioni ACP     : $($acpViolated.Count)"  -ForegroundColor $(if ($acpViolated.Count -gt 0) { "Red" } else { "Green" })
+Write-Host "  Impattate (totale) : $($impacted.Count)"     -ForegroundColor $(if ($impacted.Count -gt 0) { "Red" } else { "Green" })
+Write-Host "  Non impattate      : $($clean.Count)"        -ForegroundColor Green
+
+Write-Host ""
+Write-Host "  Cross-referencing DLP / Granular DLP / ACP:" -ForegroundColor Cyan
+Write-Host "    Solo DLP                 : $($xDlpOnly.Count)"
+Write-Host "    Solo Granular DLP        : $($xGdlpOnly.Count)"
+Write-Host "    Solo ACP                 : $($xAcpOnly.Count)"
+Write-Host "    DLP + Granular DLP       : $($xDlpGdlp.Count)"
+Write-Host "    DLP + ACP                : $($xDlpAcp.Count)"
+Write-Host "    Granular DLP + ACP       : $($xGdlpAcp.Count)"
+Write-Host "    DLP + Granular DLP + ACP : $($xAllThree.Count)" -ForegroundColor $(if ($xAllThree.Count -gt 0) { "Red" } else { "Gray" })
 
 if ($violated.Count -gt 0) {
     Write-Host ""
-    Write-Host "  Dettaglio violazioni:" -ForegroundColor Red
+    Write-Host "  Dettaglio violazioni DLP:" -ForegroundColor Red
     $violated | Format-Table EnvironmentName, ResourceType, ResourceName, Owner, ViolationReason -AutoSize
+}
+
+if ($gdlpViolated.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  Dettaglio violazioni Granular DLP (action control / endpoint filtering):" -ForegroundColor Red
+    $gdlpViolated | Format-Table EnvironmentName, ResourceType, ResourceName, Owner, GranularDlpViolationReason -AutoSize
+}
+
+if ($acpViolated.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  Dettaglio violazioni ACP (Advanced Connector Policies, default-deny):" -ForegroundColor Red
+    $acpViolated | Format-Table EnvironmentName, ResourceType, ResourceName, Owner, AcpViolationReason -AutoSize
+}
+
+$multiImpacted = @($results | Where-Object { $_.ImpactCount -gt 1 })
+if ($multiImpacted.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  Risorse impattate da piu' controlli contemporaneamente:" -ForegroundColor Red
+    $multiImpacted | Format-Table EnvironmentName, ResourceType, ResourceName, Owner, ImpactSources -AutoSize
 }
 
 $outDir = Split-Path -Parent $OutputCsv
